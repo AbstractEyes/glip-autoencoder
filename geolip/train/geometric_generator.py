@@ -33,10 +33,12 @@ from .voxel_generator import (
 class SDFRenderer:
     """Renders shapes as continuous signed distance fields on 64×64 grids."""
 
-    def __init__(self):
-        y, x = np.mgrid[:64, :64].astype(np.float32)
+    def __init__(self, width: int = 64, height: int = 64):
+        y, x = np.mgrid[:height, :width].astype(np.float32)
         self._yy = y
         self._xx = x
+        self.width = width
+        self.height = height
 
     def sphere(self, cx, cy, r):
         d = np.sqrt((self._xx - cx) ** 2 + (self._yy - cy) ** 2) - r
@@ -229,9 +231,9 @@ class GeometricShapeGenerator:
     frequency modulation and structured noise.
     """
 
-    def __init__(self, seed: int = 42):
+    def __init__(self, seed: int = 42, width: int = 64, height: int = 64):
         self.rng = np.random.RandomState(seed)
-        self.sdf = SDFRenderer()
+        self.sdf = SDFRenderer(width=width, height=height)
 
     def render_shape(self, name: str, cx: float, cy: float, scale: float,
                      angle: float) -> np.ndarray:
@@ -317,54 +319,61 @@ class GeometricShapeGenerator:
         # Fallback
         return self.sdf.sphere(cx, cy, 10 * scale)
 
-    def composite_to_latent(self, composite: np.ndarray) -> np.ndarray:
+    def composite_to_latent(self, composite: np.ndarray, channels: int = 32) -> np.ndarray:
         """
-        (64, 64) composite density → (32, 64, 64) simulated latent.
+        (H, W) composite density → (C, H, W) simulated latent.
 
         Each channel gets deterministic frequency modulation.
         This simulates how a real VAE distributes information
         across channels — different channels encode different
         frequency components of the input.
         """
-        latent = np.zeros((32, 64, 64), dtype=np.float32)
-        for c in range(32):
+        H, W = composite.shape
+        latent = np.zeros((channels, H, W), dtype=np.float32)
+        for c in range(channels):
             freq = 1.0 + c * 0.3
             phase = c * np.pi / 16
             modulation = 0.5 + 0.5 * np.sin(freq * composite * np.pi + phase)
             latent[c] = composite * modulation
-            latent[c] += self.rng.randn(64, 64).astype(np.float32) * 0.05 * (1 + 0.1 * c)
+            latent[c] += self.rng.randn(H, W).astype(np.float32) * 0.05 * (1 + 0.1 * c)
         return latent
 
     def generate_sample(
-        self, n_shapes: Optional[int] = None
+        self, n_shapes: Optional[int] = None, channels: int = 32
     ) -> Tuple[np.ndarray, List[str], Dict[str, np.ndarray], Dict[str, Tuple]]:
         """
         Returns:
-            latent: (32, 64, 64) multi-channel simulated latent
+            latent: (C, H, W) multi-channel simulated latent
             labels: list of shape names
-            masks: {name: (64, 64)} per-shape density
+            masks: {name: (H, W)} per-shape density
             geometry: {name: (dim, curved, curvature_str)}
         """
+        H, W = self.sdf.height, self.sdf.width
         if n_shapes is None:
             n_shapes = self.rng.randint(2, 6)
 
         choices = self.rng.choice(NUM_CLASSES, n_shapes, replace=False)
-        composite = np.zeros((64, 64), dtype=np.float32)
+        composite = np.zeros((H, W), dtype=np.float32)
         labels = []
         masks = {}
+
+        # Place shapes with margins relative to grid size
+        margin = max(4, min(H, W) // 5)
+        hi_x = max(margin + 1, W - margin)
+        hi_y = max(margin + 1, H - margin)
 
         for idx in choices:
             name = CLASS_NAMES[idx]
             labels.append(name)
-            cx = self.rng.randint(14, 50)
-            cy = self.rng.randint(14, 50)
+            cx = self.rng.randint(margin, hi_x)
+            cy = self.rng.randint(margin, hi_y)
             scale = self.rng.uniform(0.6, 1.4)
             angle = self.rng.uniform(0, 2 * np.pi)
             mask = self.render_shape(name, float(cx), float(cy), scale, angle)
             masks[name] = mask
             composite = np.maximum(composite, mask)
 
-        latent = self.composite_to_latent(composite)
+        latent = self.composite_to_latent(composite, channels=channels)
         geometry = {
             name: (
                 SHAPE_CATALOG[name]["dim"],
@@ -382,27 +391,67 @@ class GeometricShapeGenerator:
 
 class GeometricMultiShapeDataset(Dataset):
     """
-    Multi-shape compositions as (32, 64, 64) latents.
+    Multi-shape compositions as simulated VAE latents.
     Returns (latent, label_vec) for multi-label training.
+
+    Args:
+        n_samples:   number of samples
+        channels:    latent channels (default 32)
+        height:      spatial height (default 64)
+        width:       spatial width (default 64)
+        n_shapes:    fixed shape count per sample, or None for random 2-5
+        seed:        reproducibility seed
+        precompute:  if True, generate all at init (fast epoch, more RAM)
+                     if False, generate on-the-fly (slow epoch, no RAM)
     """
 
-    def __init__(self, n_samples: int = 10000, seed: int = 42):
-        self.data = []
-        gen = GeometricShapeGenerator(seed=seed)
-        for i in range(n_samples):
-            if i % 2000 == 0:
-                gen = GeometricShapeGenerator(seed=seed + i)
-            latent, labels, _, _ = gen.generate_sample()
-            label_vec = np.zeros(NUM_CLASSES, dtype=np.float32)
-            for name in labels:
-                label_vec[CLASS_TO_IDX[name]] = 1.0
-            self.data.append((
-                torch.from_numpy(latent),
-                torch.from_numpy(label_vec),
-            ))
+    def __init__(
+        self,
+        n_samples: int = 10000,
+        channels: int = 32,
+        height: int = 64,
+        width: int = 64,
+        n_shapes: Optional[int] = None,
+        seed: int = 42,
+        precompute: bool = True,
+    ):
+        self.n_samples = n_samples
+        self.channels = channels
+        self.height = height
+        self.width = width
+        self.n_shapes = n_shapes
+        self.seed = seed
+        self.precompute = precompute
+
+        if precompute:
+            self.data = []
+            gen = GeometricShapeGenerator(seed=seed, width=width, height=height)
+            for i in range(n_samples):
+                if i % 2000 == 0 and i > 0:
+                    gen = GeometricShapeGenerator(seed=seed + i, width=width, height=height)
+                latent, label_vec = self._make_sample(gen, seed + i)
+                self.data.append((latent, label_vec))
+        else:
+            self.data = None
+
+    def _make_sample(self, gen: 'GeometricShapeGenerator', sample_seed: int):
+        """Generate one (latent, label_vec) pair."""
+        latent_np, labels, _, _ = gen.generate_sample(
+            n_shapes=self.n_shapes, channels=self.channels
+        )
+
+        label_vec = np.zeros(NUM_CLASSES, dtype=np.float32)
+        for name in labels:
+            label_vec[CLASS_TO_IDX[name]] = 1.0
+
+        return torch.from_numpy(latent_np), torch.from_numpy(label_vec)
 
     def __len__(self):
-        return len(self.data)
+        return self.n_samples
 
     def __getitem__(self, idx):
-        return self.data[idx]
+        if self.precompute:
+            return self.data[idx]
+        # Lazy generation: deterministic per index
+        gen = GeometricShapeGenerator(seed=self.seed + idx, width=self.width, height=self.height)
+        return self._make_sample(gen, self.seed + idx)
