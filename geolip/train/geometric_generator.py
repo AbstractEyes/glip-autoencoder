@@ -1,24 +1,35 @@
 """
-Geometric Shape Generator
-==========================
+Geometric Shape Factory
+========================
 
-High-fidelity continuous SDF shapes at (32, 64, 64) for
-Patchwork and Chunk training. Same 38-class vocabulary as the
-voxel generator but rendered as signed distance fields with
-multi-channel latent simulation.
+Pure generation utilities for SDF-based geometric shapes.
+No torch dependency — returns numpy arrays only.
 
-Multi-shape: 2-5 shapes per sample, varying position/scale/orientation.
-32 channels simulate VAE-like latent representations with
-deterministic per-channel frequency modulation.
+38-class shape vocabulary rendered as signed distance fields.
+Multi-shape composition with configurable spatial resolution
+and channel count for simulated VAE latent structure.
+
+Usage:
+    factory = GeometricShapeFactory(width=64, height=64, seed=42)
+
+    # Single sample
+    latent, labels, masks, geometry = factory(channels=32, n_shapes=3)
+
+    # Iterator
+    for latent, labels, masks, geometry in factory.stream(n=1000, channels=32):
+        ...
 
 Author: AbstractPhil + Claude
 """
 
 import math
 import numpy as np
-import torch
-from torch.utils.data import Dataset
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Iterator
+
+
+# ---------------------------------------------------------------------------
+# Shape catalog (imported from voxel_generator to stay canonical)
+# ---------------------------------------------------------------------------
 
 from .voxel_generator import (
     SHAPE_CATALOG, CLASS_NAMES, NUM_CLASSES, CLASS_TO_IDX,
@@ -26,12 +37,12 @@ from .voxel_generator import (
 )
 
 
-# =============================================================================
-# SDF Primitives (64×64 slices)
-# =============================================================================
+# ---------------------------------------------------------------------------
+# SDF Primitives
+# ---------------------------------------------------------------------------
 
 class SDFRenderer:
-    """Renders shapes as continuous signed distance fields on 64×64 grids."""
+    """Renders shapes as continuous signed distance fields on H×W grids."""
 
     def __init__(self, width: int = 64, height: int = 64):
         y, x = np.mgrid[:height, :width].astype(np.float32)
@@ -103,7 +114,7 @@ class SDFRenderer:
         return np.clip(1.0 - d / 2.0, 0, 1)
 
     def helix(self, cx, cy, r, pitch, thickness=1.0):
-        t = self._yy / 64.0 * 4.0 * np.pi
+        t = self._yy / max(self.height, 1) * 4.0 * np.pi
         hx = cx + r * np.cos(t + pitch)
         d = np.abs(np.sqrt((self._xx - hx) ** 2)) - thickness
         return np.clip(1.0 - np.abs(d) / 2.0, 0, 1)
@@ -114,7 +125,6 @@ class SDFRenderer:
         return self.line(x0, y0, x1, y1, thickness)
 
     def cone(self, cx, cy, r_base, height):
-        # Varying radius from base to apex
         t = np.clip((self._yy - (cy - height / 2)) / max(height, 1e-6), 0, 1)
         r = r_base * (1.0 - t)
         d = np.sqrt((self._xx - cx) ** 2) - r
@@ -156,7 +166,7 @@ class SDFRenderer:
         return np.clip(1.0 - np.abs(d) * min(rx, ry) / 2.0, 0, 1)
 
     def rectangle(self, cx, cy, hx, hy):
-        return self.cube(cx, cy, max(hx, hy))  # approximation
+        return self.cube(cx, cy, max(hx, hy))
 
     def point(self, cx, cy, size=2.0):
         return self.sphere(cx, cy, size)
@@ -171,11 +181,10 @@ class SDFRenderer:
         return self.ring(cx, cy, R, r)
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # Shape → SDF dispatch
-# =============================================================================
+# ---------------------------------------------------------------------------
 
-# Map shape names to renderer method + default params
 _SHAPE_RENDER_MAP = {
     "point":            ("point",      {"size": 2.0}),
     "line_x":           ("line",       {"axis": "h"}),
@@ -207,37 +216,48 @@ _SHAPE_RENDER_MAP = {
     "disc":             ("disc",       {"r": 12}),
     "sphere":           ("sphere",     {"r": 12}),
     "hemisphere":       ("hemisphere", {"r": 12}),
-    "cylinder":         ("cylinder",   {"r": 8, "half_h": 14}),
-    "cone":             ("cone",       {"r_base": 10, "height": 20}),
+    "cylinder":         ("cylinder",   {"r": 8, "half_h": 12}),
+    "cone":             ("cone",       {"r_base": 10, "height": 18}),
     "capsule":          ("capsule",    {"r": 6, "half_h": 10}),
     "torus":            ("torus",      {"R": 12, "r": 4}),
     "shell":            ("shell",      {"R": 14, "thickness": 3}),
     "tube":             ("tube",       {"R": 10, "r": 3}),
     "bowl":             ("bowl",       {"R": 14, "thickness": 3}),
-    "saddle":           ("saddle",     {"scale": 10}),
+    "saddle":           ("saddle",     {"scale": 8}),
 }
 
 
-# =============================================================================
-# Multi-Shape Geometric Generator
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
 
-class GeometricShapeGenerator:
+class GeometricShapeFactory:
     """
-    Generates multi-shape compositions as (32, 64, 64) continuous latents.
+    Pure numpy factory for geometric shape generation.
 
-    Each sample: 2-5 shapes rendered as SDF, composed via max,
-    then expanded to 32 channels with deterministic per-channel
-    frequency modulation and structured noise.
+    Produces (C, H, W) simulated VAE latents from SDF compositions.
+    No torch dependency. Stateful RNG for reproducibility.
+
+    Usage:
+        factory = GeometricShapeFactory(width=64, height=64, seed=42)
+        latent, labels, masks, geometry = factory(channels=32, n_shapes=3)
     """
 
-    def __init__(self, seed: int = 42, width: int = 64, height: int = 64):
+    def __init__(self, width: int = 64, height: int = 64, seed: int = 42):
+        self.width = width
+        self.height = height
+        self.seed = seed
         self.rng = np.random.RandomState(seed)
         self.sdf = SDFRenderer(width=width, height=height)
 
-    def render_shape(self, name: str, cx: float, cy: float, scale: float,
-                     angle: float) -> np.ndarray:
-        """Render a single shape at given position/scale."""
+    def reset(self, seed: int = None):
+        """Reset RNG state. Uses original seed if none given."""
+        self.rng = np.random.RandomState(seed if seed is not None else self.seed)
+
+    def render_shape(
+        self, name: str, cx: float, cy: float, scale: float, angle: float
+    ) -> np.ndarray:
+        """Render a single named shape at given position/scale/angle."""
         method_name, defaults = _SHAPE_RENDER_MAP.get(name, ("sphere", {"r": 10}))
         method = getattr(self.sdf, method_name)
 
@@ -257,76 +277,54 @@ class GeometricShapeGenerator:
 
         elif method_name == "ray":
             return self.sdf.ray(cx, cy, angle, defaults["length"] * scale)
-
         elif method_name in ("sphere", "disc", "point"):
             r = defaults.get("r", defaults.get("size", 10)) * scale
             return method(cx, cy, r)
-
         elif method_name == "cube":
             return method(cx, cy, defaults["half"] * scale)
-
         elif method_name == "cross":
             return method(cx, cy, defaults["arm_len"] * scale)
-
         elif method_name == "triangle":
             return method(cx, cy, defaults["size"] * scale)
-
         elif method_name == "torus":
             return method(cx, cy, defaults["R"] * scale, defaults["r"] * scale)
-
         elif method_name == "ring":
             return method(cx, cy, defaults["R"] * scale, defaults.get("r", 2) * scale)
-
         elif method_name == "cylinder":
             return method(cx, cy, defaults["r"] * scale, defaults["half_h"] * scale)
-
         elif method_name == "cone":
             return method(cx, cy, defaults["r_base"] * scale, defaults["height"] * scale)
-
         elif method_name == "capsule":
             return method(cx, cy, defaults["r"] * scale, defaults["half_h"] * scale)
-
         elif method_name == "shell":
             return method(cx, cy, defaults["R"] * scale, defaults.get("thickness", 3) * scale)
-
         elif method_name == "hemisphere":
             return method(cx, cy, defaults["r"] * scale)
-
         elif method_name == "bowl":
             return method(cx, cy, defaults["R"] * scale, defaults.get("thickness", 3) * scale)
-
         elif method_name == "saddle":
             return method(cx, cy, defaults["scale"] * scale)
-
         elif method_name == "helix":
             return method(cx, cy, defaults["r"] * scale, defaults.get("pitch", 0.5))
-
         elif method_name == "ellipse":
             return method(cx, cy, defaults["rx"] * scale, defaults["ry"] * scale)
-
         elif method_name == "plane":
             return method(cy, defaults["thickness"] * scale)
-
         elif method_name == "rectangle":
             return method(cx, cy, defaults["hx"] * scale, defaults["hy"] * scale)
-
         elif method_name == "octahedron":
             return method(cx, cy, defaults["size"] * scale)
-
         elif method_name == "tube":
             return method(cx, cy, defaults["R"] * scale, defaults["r"] * scale)
 
-        # Fallback
         return self.sdf.sphere(cx, cy, 10 * scale)
 
     def composite_to_latent(self, composite: np.ndarray, channels: int = 32) -> np.ndarray:
         """
-        (H, W) composite density → (C, H, W) simulated latent.
+        (H, W) composite density → (C, H, W) simulated VAE latent.
 
-        Each channel gets deterministic frequency modulation.
-        This simulates how a real VAE distributes information
-        across channels — different channels encode different
-        frequency components of the input.
+        Each channel gets deterministic frequency modulation simulating
+        how a real VAE distributes information across channels.
         """
         H, W = composite.shape
         latent = np.zeros((channels, H, W), dtype=np.float32)
@@ -338,17 +336,21 @@ class GeometricShapeGenerator:
             latent[c] += self.rng.randn(H, W).astype(np.float32) * 0.05 * (1 + 0.1 * c)
         return latent
 
-    def generate_sample(
-        self, n_shapes: Optional[int] = None, channels: int = 32
+    def __call__(
+        self,
+        channels: int = 32,
+        n_shapes: Optional[int] = None,
     ) -> Tuple[np.ndarray, List[str], Dict[str, np.ndarray], Dict[str, Tuple]]:
         """
+        Generate one sample.
+
         Returns:
-            latent: (C, H, W) multi-channel simulated latent
-            labels: list of shape names
-            masks: {name: (H, W)} per-shape density
+            latent:   (C, H, W) float32 — simulated VAE latent
+            labels:   list of shape names present
+            masks:    {name: (H, W)} per-shape SDF density
             geometry: {name: (dim, curved, curvature_str)}
         """
-        H, W = self.sdf.height, self.sdf.width
+        H, W = self.height, self.width
         if n_shapes is None:
             n_shapes = self.rng.randint(2, 6)
 
@@ -357,7 +359,6 @@ class GeometricShapeGenerator:
         labels = []
         masks = {}
 
-        # Place shapes with margins relative to grid size
         margin = max(4, min(H, W) // 5)
         hi_x = max(margin + 1, W - margin)
         hi_y = max(margin + 1, H - margin)
@@ -384,74 +385,32 @@ class GeometricShapeGenerator:
         }
         return latent, labels, masks, geometry
 
-
-# =============================================================================
-# Dataset
-# =============================================================================
-
-class GeometricMultiShapeDataset(Dataset):
-    """
-    Multi-shape compositions as simulated VAE latents.
-    Returns (latent, label_vec) for multi-label training.
-
-    Args:
-        n_samples:   number of samples
-        channels:    latent channels (default 32)
-        height:      spatial height (default 64)
-        width:       spatial width (default 64)
-        n_shapes:    fixed shape count per sample, or None for random 2-5
-        seed:        reproducibility seed
-        precompute:  if True, generate all at init (fast epoch, more RAM)
-                     if False, generate on-the-fly (slow epoch, no RAM)
-    """
-
-    def __init__(
+    def stream(
         self,
-        n_samples: int = 10000,
+        n: int,
         channels: int = 32,
-        height: int = 64,
-        width: int = 64,
         n_shapes: Optional[int] = None,
-        seed: int = 42,
-        precompute: bool = True,
-    ):
-        self.n_samples = n_samples
-        self.channels = channels
-        self.height = height
-        self.width = width
-        self.n_shapes = n_shapes
-        self.seed = seed
-        self.precompute = precompute
+    ) -> Iterator[Tuple[np.ndarray, List[str], Dict[str, np.ndarray], Dict[str, Tuple]]]:
+        """Yield n samples sequentially. Respects RNG state continuity."""
+        for _ in range(n):
+            yield self(channels=channels, n_shapes=n_shapes)
 
-        if precompute:
-            self.data = []
-            gen = GeometricShapeGenerator(seed=seed, width=width, height=height)
-            for i in range(n_samples):
-                if i % 2000 == 0 and i > 0:
-                    gen = GeometricShapeGenerator(seed=seed + i, width=width, height=height)
-                latent, label_vec = self._make_sample(gen, seed + i)
-                self.data.append((latent, label_vec))
-        else:
-            self.data = None
+    def batch(
+        self,
+        n: int,
+        channels: int = 32,
+        n_shapes: Optional[int] = None,
+    ) -> Tuple[np.ndarray, List[List[str]]]:
+        """
+        Generate n samples, stack latents into a single array.
 
-    def _make_sample(self, gen: 'GeometricShapeGenerator', sample_seed: int):
-        """Generate one (latent, label_vec) pair."""
-        latent_np, labels, _, _ = gen.generate_sample(
-            n_shapes=self.n_shapes, channels=self.channels
-        )
-
-        label_vec = np.zeros(NUM_CLASSES, dtype=np.float32)
-        for name in labels:
-            label_vec[CLASS_TO_IDX[name]] = 1.0
-
-        return torch.from_numpy(latent_np), torch.from_numpy(label_vec)
-
-    def __len__(self):
-        return self.n_samples
-
-    def __getitem__(self, idx):
-        if self.precompute:
-            return self.data[idx]
-        # Lazy generation: deterministic per index
-        gen = GeometricShapeGenerator(seed=self.seed + idx, width=self.width, height=self.height)
-        return self._make_sample(gen, self.seed + idx)
+        Returns:
+            latents: (N, C, H, W) float32
+            all_labels: list of N label lists
+        """
+        latents = []
+        all_labels = []
+        for latent, labels, _, _ in self.stream(n, channels, n_shapes):
+            latents.append(latent)
+            all_labels.append(labels)
+        return np.stack(latents, axis=0), all_labels
