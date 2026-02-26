@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geochunker"
+version = "0.1.0"
+description = "Geometric Structural Vocabulary — Deterministic topological token architecture"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [{name = "AbstractPhil"}]
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+train = [
+    "tqdm",
+    "tensorboard",
+]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+include = ["geochunker*"]
