@@ -13,20 +13,96 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from typing import Optional, Dict, List, Tuple, NamedTuple
+from typing import Optional, Dict, List, Tuple
 
-from ..core import KSimplexLinear, CantorTopology, CayleyMengerValidator
+from ..core.ksimplex_linear import KSimplexLinear
+from ..core.cayley_menger import CayleyMengerValidator
+from ..core.topology import CantorTopology
 from .patch import Patchifier
 from .state import TopologicalState
 
 
-class PatchworkOutput(NamedTuple):
-    composed: Tensor
-    active_indices: Tensor
-    routing_weights: Tensor
-    vol_sq: Tensor
-    loss: Optional[Tensor]
-    loss_dict: Optional[Dict[str, float]]
+class PatchworkOutput:
+    """
+    Output container for Patchwork forward pass.
+
+    Access patterns:
+        out.composed          — (B, tokens_per_state, token_dim) main output
+        out.shape             — shortcut for out.composed.shape
+        out.active_indices    — which states were active
+        out.routing_weights   — soft routing weights
+        out.vol_sq            — per-state CM volumes squared
+        out.loss              — CM validity loss (for training)
+        out.loss_dict         — dict of detached loss components
+
+    Tensor-like:
+        out.shape, out.dtype, out.device all delegate to composed.
+        out[0] indexes into composed. out.detach() detaches composed.
+    """
+
+    __slots__ = ("composed", "active_indices", "routing_weights", "vol_sq", "loss", "loss_dict")
+
+    def __init__(
+        self,
+        composed: Tensor,
+        active_indices: Tensor,
+        routing_weights: Tensor,
+        vol_sq: Tensor,
+        loss: Optional[Tensor] = None,
+        loss_dict: Optional[Dict[str, float]] = None,
+    ):
+        self.composed = composed
+        self.active_indices = active_indices
+        self.routing_weights = routing_weights
+        self.vol_sq = vol_sq
+        self.loss = loss
+        self.loss_dict = loss_dict or {}
+
+    # --- Tensor-like delegation to composed ---
+
+    @property
+    def shape(self):
+        return self.composed.shape
+
+    @property
+    def dtype(self):
+        return self.composed.dtype
+
+    @property
+    def device(self):
+        return self.composed.device
+
+    def size(self, *args):
+        return self.composed.size(*args)
+
+    def dim(self):
+        return self.composed.dim()
+
+    def __getitem__(self, idx):
+        return self.composed[idx]
+
+    def __len__(self):
+        return self.composed.shape[0]
+
+    def detach(self):
+        return PatchworkOutput(
+            composed=self.composed.detach(),
+            active_indices=self.active_indices.detach(),
+            routing_weights=self.routing_weights.detach(),
+            vol_sq=self.vol_sq.detach(),
+            loss=self.loss.detach() if self.loss is not None else None,
+            loss_dict=self.loss_dict,
+        )
+
+    def __repr__(self):
+        return (
+            f"PatchworkOutput(shape={self.shape}, "
+            f"active={self.active_indices.shape[-1]} states, "
+            f"loss={self.loss.item():.6f})"
+            if self.loss is not None
+            else f"PatchworkOutput(shape={self.shape}, "
+            f"active={self.active_indices.shape[-1]} states)"
+        )
 
 
 class NeedsBasedRouter(nn.Module):

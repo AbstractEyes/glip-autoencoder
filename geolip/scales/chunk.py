@@ -14,7 +14,8 @@ import torch.nn.functional as F
 from torch import Tensor
 from typing import Optional, Dict, List, Tuple, NamedTuple
 
-from ..core import KSimplexLinear, CantorTopology, CayleyMengerValidator
+from ..core.cayley_menger import CayleyMengerValidator
+from ..core.topology import CantorTopology
 from .patch import Patchifier
 from .state import TopologicalState
 from .patchwork import NeedsBasedRouter, CrossStateComposition
