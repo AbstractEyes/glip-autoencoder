@@ -3,9 +3,9 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "geochunker"
+name = "geolip"
 version = "0.1.0"
-description = "Geometric Structural Vocabulary — Deterministic topological token architecture"
+description = "Geometric Linear Interpolative Patchwork Vocabulary — Deterministic topological token architecture"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 authors = [{name = "AbstractPhil"}]
@@ -26,4 +26,4 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["geochunker*"]
+include = ["geolip*"]
