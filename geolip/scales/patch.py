@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from ..core.ksimplex_linear import KSimplexLinear
+from ..core import KSimplexLinear
 
 
 class Patchifier(nn.Module):
