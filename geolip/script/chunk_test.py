@@ -6,12 +6,12 @@ Validates topology, parameter counts, forward pass, gradient flow.
 Runs with a reduced active budget for memory.
 
 Usage:
-    python -m geochunker.script.chunk_test
+    python -m geolip.script.chunk_test
 """
 
 import torch
-from geochunker.core import CantorTopology
-from geochunker.scales import Chunk
+from geolip.core import CantorTopology
+from geolip.scales import Chunk
 
 
 def main():

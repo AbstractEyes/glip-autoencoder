@@ -1,5 +1,5 @@
 """
-geochunker — Geometric Structural Vocabulary
+geolip — Geometric linear interpolative patchwork Vocabulary
 =============================================
 
 512 × 256 × 64 = 8,388,608 tokens.
