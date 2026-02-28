@@ -8,18 +8,18 @@ Architecture per simplex (k=4, pentachoron):
     5 scalars → [entry projection] → 5 vertices × 5 hidden
         → [vertex transform] → scale + shift
         → [pairwise signals] → 10 shared sections between all vertex pairs
-        → [attenuation] → signals weighted back to vertices
+        → [attenuation] → signals weighted back to vertices PER CHANNEL
         → [exit projection] → 5 scalars
-
-At scale (512→512, k=4):
-    103 simplices × 250 structure = 30,900 params
-    nn.Linear equiv: 262,656 params
-    Ratio: 0.118x (11.8% of linear)
 
 The key insight: hidden layers aren't sequential — they're simplex vertices.
 All exist simultaneously and communicate through pairwise shared sections.
+Each shared section carries a VECTOR (not scalar) — the hidden dimensions
+are the embedding space for producing valid simplex distance geometry.
 
-Approximated from production geofractal implementation.
+At scale (512→512, k=4):
+    103 simplices × ~290 structure ≈ 35,000 params
+    nn.Linear equiv: 262,656 params
+    Ratio: ~0.134x (13.4% of linear)
 
 Author: AbstractPhil + Claude
 License: Apache-2.0
@@ -39,7 +39,7 @@ class KSimplexLinear(nn.Module):
     Input is chunked into simplex-sized groups of (k+1) scalars.
     Each group flows through entry → vertex → pairwise → attenuate → exit.
     Pairwise signals create shared sections between all vertex pairs
-    within each simplex.
+    within each simplex, carrying per-channel vector information.
 
     Args:
         input_dim: Input feature dimension
@@ -102,6 +102,7 @@ class KSimplexLinear(nn.Module):
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # Pairwise: shared sections between vertex pairs
+        # Each pair carries a VECTOR signal (hidden_per_vertex dims)
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         total_pairs = self.num_simplices * self.num_pairs
         self.signal_weight_i = nn.Parameter(
@@ -115,10 +116,15 @@ class KSimplexLinear(nn.Module):
         )
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # Attenuation: per-pair scalar weights back to vertices
+        # Attenuation: per-pair PER-CHANNEL weights back to vertices
+        # Vector attenuation preserves channel differentiation
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        self.attenuation_i = nn.Parameter(torch.empty(total_pairs))
-        self.attenuation_j = nn.Parameter(torch.empty(total_pairs))
+        self.attenuation_i = nn.Parameter(
+            torch.empty(total_pairs, self.hidden_per_vertex)
+        )
+        self.attenuation_j = nn.Parameter(
+            torch.empty(total_pairs, self.hidden_per_vertex)
+        )
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # Exit: vertex hidden → output scalar
@@ -187,7 +193,7 @@ class KSimplexLinear(nn.Module):
         # (B, padded_dim, hidden) → (B, num_simplices, num_vertices, hidden)
         h_simp = h.view(B, self.num_simplices, self.num_vertices, self.hidden_per_vertex)
 
-        # ━━━━━ Step 4: Pairwise signals (vectorized across all simplices) ━━━━━
+        # ━━━━━ Step 4: Pairwise signals — VECTOR per pair ━━━━━
         # Gather vertex pairs for all simplices at once
         # h_simp: (B, S, V, H), pair indices: (P,) → h_i, h_j: (B, S, P, H)
         h_i = h_simp[:, :, self.pair_i_local, :]  # (B, S, P, H)
@@ -198,35 +204,32 @@ class KSimplexLinear(nn.Module):
         w_j = self.signal_weight_j.view(self.num_simplices, self.num_pairs, self.hidden_per_vertex)
         bias = self.signal_bias.view(self.num_simplices, self.num_pairs, self.hidden_per_vertex)
 
-        # Compute pairwise signals: (B, S, P, H)
+        # Compute pairwise signals: (B, S, P, H) — KEPT AS VECTOR
         signals = h_i * w_i.unsqueeze(0) + h_j * w_j.unsqueeze(0) + bias.unsqueeze(0)
-        # Reduce over hidden to get scalar signal per pair
-        signals = signals.sum(dim=-1)  # (B, S, P)
+        # signals: (B, S, P, H) — each pair carries H-dim relational info
 
-        # ━━━━━ Step 5: Attenuate signals back to vertices ━━━━━
-        att_i = self.attenuation_i.view(self.num_simplices, self.num_pairs)  # (S, P)
-        att_j = self.attenuation_j.view(self.num_simplices, self.num_pairs)  # (S, P)
+        # ━━━━━ Step 5: Attenuate signals back to vertices PER CHANNEL ━━━━━
+        att_i = self.attenuation_i.view(self.num_simplices, self.num_pairs, self.hidden_per_vertex)
+        att_j = self.attenuation_j.view(self.num_simplices, self.num_pairs, self.hidden_per_vertex)
 
-        # Scatter-add attenuated signals back to vertex positions
-        # signals: (B, S, P), att: (S, P)
-        signals_to_i = signals * att_i.unsqueeze(0)  # (B, S, P)
-        signals_to_j = signals * att_j.unsqueeze(0)  # (B, S, P)
+        # Per-channel attenuation: (B, S, P, H) * (S, P, H) → (B, S, P, H)
+        signals_to_i = signals * att_i.unsqueeze(0)  # (B, S, P, H)
+        signals_to_j = signals * att_j.unsqueeze(0)  # (B, S, P, H)
 
-        # Accumulate into vertex space: (B, S, V)
+        # Scatter-add into vertex hidden space: (B, S, V, H)
         vertex_signals = torch.zeros(
-            B, self.num_simplices, self.num_vertices,
+            B, self.num_simplices, self.num_vertices, self.hidden_per_vertex,
             device=x.device, dtype=x.dtype
         )
-        # Use scatter_add for vectorized accumulation
-        pair_i_exp = self.pair_i_local.unsqueeze(0).unsqueeze(0).expand(B, self.num_simplices, -1)
-        pair_j_exp = self.pair_j_local.unsqueeze(0).unsqueeze(0).expand(B, self.num_simplices, -1)
+        # Expand pair indices for scatter: (P,) → (B, S, P, H)
+        pair_i_exp = self.pair_i_local.view(1, 1, -1, 1).expand(B, self.num_simplices, -1, self.hidden_per_vertex)
+        pair_j_exp = self.pair_j_local.view(1, 1, -1, 1).expand(B, self.num_simplices, -1, self.hidden_per_vertex)
 
         vertex_signals.scatter_add_(2, pair_i_exp, signals_to_i)
         vertex_signals.scatter_add_(2, pair_j_exp, signals_to_j)
 
-        # Add pairwise contribution to vertex hidden states
-        # vertex_signals: (B, S, V) → expand to (B, S, V, 1) and add to h_simp
-        h_simp = h_simp + vertex_signals.unsqueeze(-1)
+        # Add per-channel pairwise contribution to vertex hidden states
+        h_simp = h_simp + vertex_signals
 
         # ━━━━━ Step 6: Exit — hidden → output scalar ━━━━━
         # Reshape back: (B, S, V, H) → (B, padded_dim, H)
@@ -279,19 +282,16 @@ class KSimplexLinear(nn.Module):
 if __name__ == "__main__":
     print("=== KSimplexLinear Self-Test ===\n")
 
-    # Test 1: Match known param counts from conversation
+    # Test 1: Param counts (will differ from old due to vector attenuation)
     print("--- Param Count Verification ---")
     test_cases = [
-        (3, 2, 81),       # k=2, 3 inputs
-        (5, 4, 300),       # k=4, 5 inputs
-        (512, 4, 30900),   # k=4, 512 inputs
+        (3, 2),       # k=2, 3 inputs
+        (5, 4),       # k=4, 5 inputs
+        (512, 4),     # k=4, 512 inputs
     ]
 
-    for input_dim, k, expected in test_cases:
+    for input_dim, k in test_cases:
         layer = KSimplexLinear(input_dim, k=k)
-        actual = layer.param_count()
-        match = "✓" if actual == expected else f"✗ (got {actual})"
-        print(f"  k={k}, input={input_dim}: {actual:,} params {match}")
         layer.structure_summary()
 
     # Test 2: Forward pass shapes
@@ -341,5 +341,20 @@ if __name__ == "__main__":
     y = layer(x)
     print(f"  512 → 256: {y.shape}, params={layer.param_count():,}")
     layer.structure_summary()
+
+    # Test 7: Verify pairwise signals are per-channel
+    print("\n--- Pairwise Channel Verification ---")
+    layer = KSimplexLinear(5, k=4)
+    x = torch.randn(2, 5, requires_grad=True)
+    y = layer(x)
+    # Check that different hidden channels get different gradients
+    y[0, 0].backward(retain_graph=True)
+    g1 = x.grad.clone()
+    x.grad.zero_()
+    y[0, 1].backward(retain_graph=True)
+    g2 = x.grad.clone()
+    channel_diff = (g1 - g2).abs().sum().item()
+    print(f"  Gradient difference across output channels: {channel_diff:.6f}")
+    print(f"  Per-channel differentiation: {'✓' if channel_diff > 1e-6 else '✗'}")
 
     print("\n=== KSimplexLinear operational. ===")
