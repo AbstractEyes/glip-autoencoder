@@ -255,52 +255,75 @@ class ShapeSurfaceAreaEstimator(FormulaBase):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class ShapeQualityMetrics(FormulaBase):
-    """Point cloud quality: uniformity, coverage, density, outliers."""
+    """Point cloud quality: uniformity, coverage, density, outliers.
+
+    Calibration targets (200 points, 3D):
+        Sphere:   ~0.88
+        Cube:     ~0.91
+        Cylinder: ~0.85
+        Line:     <0.70 (dimensional collapse detected)
+        Outliers: <0.40
+    """
 
     def __init__(self):
         super().__init__("shape_quality_metrics", "formula.shape.quality")
 
     def compute_torch(self, points: Tensor, **kw) -> Dict[str, Tensor]:
         n = points.shape[-2]
+        D = points.shape[-1]
         distances = torch.cdist(points, points)
         mask = ~torch.eye(n, dtype=torch.bool, device=points.device)
         dist_masked = distances * mask.float() + (~mask).float() * 1e6
 
-        # Nearest-neighbor distances
+        # ── Nearest-neighbor distances ──
         nn_dist = dist_masked.min(dim=-1)[0]
         nn_mean = nn_dist.mean(dim=-1)
         nn_std = nn_dist.std(dim=-1)
-        uniformity = 1.0 - torch.clamp(nn_std / (nn_mean + 1e-10), 0, 1)
 
-        # Coverage
+        # ── Uniformity: 1 - CV² of nn distances ──
+        # CV=0 → perfect grid, CV≈0.5 → typical random, CV>1 → badly clustered
+        cv = nn_std / (nn_mean + 1e-10)
+        uniformity = torch.clamp(1.0 - cv * cv, 0.0, 1.0)
+
+        # ── Coverage: min per-axis quantile span ──
+        # Catches dimensional collapse (e.g. line: one axis spans nothing)
         mn = points.min(dim=-2)[0]
         mx = points.max(dim=-2)[0]
-        bbox_vol = (mx - mn).prod(dim=-1)
-        spread = points.std(dim=-2).prod(dim=-1)
-        coverage = torch.clamp(spread / (bbox_vol + 1e-10), 0, 1)
+        dims = mx - mn + 1e-10
 
-        # Density variance
+        q05 = torch.quantile(points, 0.05, dim=-2)
+        q95 = torch.quantile(points, 0.95, dim=-2)
+        per_axis_span = (q95 - q05) / dims
+        coverage = per_axis_span.min(dim=-1)[0]
+        coverage = torch.clamp(coverage, 0.0, 1.0)
+
+        # ── Density: 1 - CV² of local density ──
         k = min(10, n - 1)
         k_nearest = torch.topk(dist_masked, k, largest=False, dim=-1)[0]
         local_density = 1.0 / (k_nearest.mean(dim=-1) + 1e-10)
-        density_var = local_density.var(dim=-1)
+        density_mean = local_density.mean(dim=-1)
+        density_std = local_density.std(dim=-1)
+        density_cv = density_std / (density_mean + 1e-10)
+        density_score = torch.clamp(1.0 - density_cv * density_cv, 0.0, 1.0)
 
-        # Outliers
+        # ── Outliers: points beyond 3× median nn distance ──
         median_nn = nn_dist.median(dim=-1)[0]
         outliers = nn_dist > median_nn.unsqueeze(-1) * 3
         outlier_frac = outliers.float().mean(dim=-1)
 
+        # ── Overall quality ──
         overall = (
-            0.4 * uniformity
-            + 0.3 * coverage
-            + 0.2 * (1.0 - torch.clamp(density_var / 10, 0, 1))
-            + 0.1 * (1.0 - outlier_frac)
+            0.30 * uniformity
+            + 0.30 * coverage
+            + 0.25 * density_score
+            + 0.15 * (1.0 - outlier_frac)
         )
 
         return {
             "uniformity": uniformity,
             "coverage": coverage,
-            "density_variance": density_var,
+            "density_score": density_score,
+            "density_variance": density_std ** 2,  # kept for backward compat
             "outlier_fraction": outlier_frac,
             "overall_quality": overall,
             "nn_distance_mean": nn_mean,

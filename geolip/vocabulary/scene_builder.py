@@ -719,7 +719,7 @@ class SceneBuilder(FactoryBase):
     # ── Validation ───────────────────────────────────────────────
 
     def validate(self, output) -> Tuple[bool, str]:
-        """Validate scene output."""
+        """Validate scene output — structural AND semantic."""
         if not isinstance(output, dict):
             return False, f"Expected dict, got {type(output)}"
 
@@ -727,15 +727,49 @@ class SceneBuilder(FactoryBase):
         if pts is None:
             return False, "Missing 'points' key"
 
-        if isinstance(pts, np.ndarray):
-            shape = pts.shape
-        elif HAS_TORCH and isinstance(pts, torch.Tensor):
-            shape = tuple(pts.shape)
-        else:
+        is_np = isinstance(pts, np.ndarray)
+        is_torch = HAS_TORCH and isinstance(pts, torch.Tensor)
+        if not (is_np or is_torch):
             return False, f"Unknown points type: {type(pts)}"
 
+        # ── Shape ──
+        shape = pts.shape if is_np else tuple(pts.shape)
         if len(shape) != 2 or shape[0] != self.points_per_scene or shape[1] != self.embed_dim:
             return False, f"Expected shape ({self.points_per_scene}, {self.embed_dim}), got {shape}"
+
+        # ── Finiteness ──
+        all_finite = np.all(np.isfinite(pts)) if is_np else bool(torch.all(torch.isfinite(pts)))
+        if not all_finite:
+            return False, "Points contain NaN or Inf"
+
+        # ── Bounds ──
+        max_abs = float(np.abs(pts).max()) if is_np else float(pts.abs().max())
+        if max_abs > 1.0 + 1e-6:
+            return False, f"Points outside [-1,1]: max_abs={max_abs:.4f}"
+
+        # ── Label-meta consistency ──
+        scene_labels = output.get("scene_labels")
+        shape_meta = output.get("shape_meta")
+        if scene_labels is not None and shape_meta is not None:
+            if is_np:
+                label_types = set(np.where(scene_labels > 0)[0].tolist())
+            else:
+                label_types = set(torch.where(scene_labels > 0)[0].tolist())
+            meta_types = set(m["type_idx"] for m in shape_meta)
+            if meta_types != label_types:
+                return False, f"Label-meta mismatch: meta={meta_types}, labels={label_types}"
+
+        # ── Point label coherence ──
+        point_labels = output.get("point_labels")
+        if point_labels is not None and scene_labels is not None:
+            if is_np:
+                absent = np.where(scene_labels == 0)[0]
+                orphans = int(point_labels[:, absent].sum()) if len(absent) > 0 else 0
+            else:
+                absent = torch.where(scene_labels == 0)[0]
+                orphans = int(point_labels[:, absent].sum()) if len(absent) > 0 else 0
+            if orphans > 0:
+                return False, f"Orphan point labels: {orphans} points labeled for absent shapes"
 
         return True, ""
 
