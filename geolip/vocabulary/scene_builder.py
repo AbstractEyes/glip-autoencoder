@@ -756,53 +756,6 @@ class SceneBuilder(FactoryBase):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# SCENE DATASET (for training)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-if HAS_TORCH:
-    class SceneDataset(torch.utils.data.Dataset):
-        """Lazy on-the-fly scene generation for DataLoader.
-
-        Each __getitem__ generates a fresh scene with a deterministic seed
-        derived from the index, so epochs are reproducible.
-
-        Args:
-            builder: SceneBuilder instance
-            length: Dataset length (scenes per epoch)
-            base_seed: Seed for reproducibility (scene i gets seed base_seed + i)
-            device: Target device for tensors
-        """
-
-        def __init__(
-            self,
-            builder: SceneBuilder,
-            length: int = 10000,
-            base_seed: int = 0,
-            device: str = "cpu",
-        ):
-            self.builder = builder
-            self.length = length
-            self.base_seed = base_seed
-            self.device = device
-
-        def __len__(self) -> int:
-            return self.length
-
-        def __getitem__(self, idx: int) -> Dict[str, "Tensor"]:
-            scene = self.builder.build_torch(
-                device=self.device,
-                seed=self.base_seed + idx,
-            )
-            # Return only stackable tensors for DataLoader collation
-            return {
-                "points": scene["points"],
-                "scene_labels": scene["scene_labels"],
-                "point_labels": scene["point_labels"],
-                "overlap_count": scene["overlap_count"],
-            }
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # SELF-TEST
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -874,18 +827,6 @@ if __name__ == "__main__":
 
         batch_t = builder.batch(4, seed=42, backend="torch")
         print(f"  batch:   {batch_t['points'].shape}")
-
-        # Dataset
-        print("\n── SceneDataset ──")
-        ds = SceneDataset(builder, length=100, base_seed=0)
-        sample = ds[0]
-        print(f"  sample keys: {list(sample.keys())}")
-        print(f"  points: {sample['points'].shape}")
-
-        # DataLoader
-        loader = torch.utils.data.DataLoader(ds, batch_size=8, num_workers=0)
-        batch_dl = next(iter(loader))
-        print(f"  DataLoader batch: points={batch_dl['points'].shape}")
 
         if torch.cuda.is_available():
             scene_gpu = builder.build(backend="torch", device="cuda:0", seed=42)
