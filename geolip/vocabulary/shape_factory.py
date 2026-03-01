@@ -326,15 +326,17 @@ class SimpleShapeFactory(FactoryBase):
         if output.shape[0] < 4:
             return False, f"Too few points: {output.shape[0]}"
 
+        # Check spread only in spatial dims (3D shapes zero-pad higher dims)
+        spatial_dims = min(3, self.embed_dim)
         if isinstance(output, np.ndarray):
             if not np.all(np.isfinite(output)):
                 return False, "Contains NaN or Inf"
-            if np.any(np.std(output, axis=0) < 1e-8):
+            if np.any(np.std(output[:, :spatial_dims], axis=0) < 1e-8):
                 return False, "Degenerate (zero spread)"
         else:
             if not torch.all(torch.isfinite(output)):
                 return False, "Contains NaN or Inf"
-            if torch.any(torch.std(output, dim=0) < 1e-8):
+            if torch.any(torch.std(output[:, :spatial_dims], dim=0) < 1e-8):
                 return False, "Degenerate (zero spread)"
 
         if self.validate_output and HAS_FORMULAS:
