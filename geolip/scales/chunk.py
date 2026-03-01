@@ -1,40 +1,54 @@
 """
-Chunk — 512 × 256 × 64 = 8,388,608 tokens
-=============================================
+Chunk — Dual-Stream Geometric Vocabulary (512 states)
+======================================================
 
 Full-scale geometric structural vocabulary.
-512 topological states at attention head alignment.
-Needs-based loading for hardware efficiency.
+512 topological states with needs-based loading.
+
+Same dual-stream architecture as Patchwork:
+    GEOMETRIC:  KSimplexChannel per patch → d², vol² (11-dim, CM-validated)
+    FEATURE:    Multi-head self-attention → learned representations (feat_dim)
+    GATING:     Geometry gates features: feat_out = feat × sigmoid(geo) × sigmoid(vol²)
+
+Key difference: max_active_states budget system.
+Only active states run forward — the rest stay dormant.
+At 512 states, full forward is never needed.
+
+Scale hierarchy:
+    Patchwork:  8 states   (patchwork.py)
+    Chunk:      512 states (this file)
+    Sector:     512 chunks (sector.py, placeholder)
+
+Author: AbstractPhil + Claude
+License: Apache-2.0
 """
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from typing import Optional, Dict, List, Tuple, NamedTuple
+from typing import Optional, Tuple
 
-from ..core import KSimplexLinear, CantorTopology, CayleyMengerValidator
-from .patch import Patchifier
-from .state import TopologicalState
-from .patchwork import NeedsBasedRouter, CrossStateComposition
-
-
-class ChunkOutput(NamedTuple):
-    composed: Tensor
-    active_indices: Tensor
-    routing_weights: Tensor
-    vol_sq: Tensor
-    loss: Optional[Tensor]
-    loss_dict: Optional[Dict[str, float]]
+from ..core import CantorTopology
+from .patchwork import (
+    KSimplexChannel,
+    GeometricState,
+    CrossStateComposition,
+    NeedsBasedRouter,
+    PatchworkOutput,
+)
 
 
 class Chunk(nn.Module):
     """
-    512 × 256 × 64 = 8,388,608 tokens.
+    512-state dual-stream geometric vocabulary.
 
-    Full geometric structural vocabulary.
-    Needs-based loading: max_active_states controls compute budget.
+    Full geometric structural vocabulary with needs-based loading.
+    max_active_states controls compute budget — only active states
+    run forward. At inference, router selects top-k states.
+
+    (B, C, H, W) → patchify → lift → N× GeometricState → compose → (B, P, combined)
+    where N = min(active_budget, 512)
     """
 
     NUM_STATES = 512
@@ -46,92 +60,158 @@ class Chunk(nn.Module):
         in_height: int = 64,
         in_width: int = 64,
         patch_grid: int = 8,
-        tokens_per_state: int = 256,
-        token_dim: int = 64,
-        simplex_k: int = 4,
-        deform_alpha: float = 0.05,
+        k: int = 4,
+        edim: int = 8,
+        feat_dim: int = 64,
+        n_heads: int = 4,
+        dropout: float = 0.1,
         max_active_states: int = 64,
     ):
         super().__init__()
-        self.tokens_per_state = tokens_per_state
-        self.token_dim = token_dim
+        self.patch_grid = patch_grid
+        self.k = k
+        self.feat_dim = feat_dim
         self.max_active_states = max_active_states
+        num_patches = patch_grid * patch_grid
 
+        pH = in_height // patch_grid
+        pW = in_width // patch_grid
+        patch_dim = in_channels * pH * pW
+
+        # ── Lift ──
+        self.geo_lift = KSimplexChannel(k, patch_dim, edim)
+        self.geo_dim = self.geo_lift.out_dim  # 11
+        self.feat_lift = nn.Sequential(
+            nn.Linear(patch_dim, feat_dim),
+            nn.GELU(),
+            nn.LayerNorm(feat_dim),
+        )
+        self.num_patches = num_patches
+        self.combined_dim = self.geo_dim + feat_dim
+
+        # ── Topology ──
         self.topology = CantorTopology(
             num_states=self.NUM_STATES, levels=self.CANTOR_LEVELS
         )
-
-        self.patchifier = Patchifier(
-            in_channels, in_height, in_width, patch_grid, simplex_k
-        )
-        patch_dim = self.patchifier.patch_dim
-
-        self.router = NeedsBasedRouter(patch_dim, self.NUM_STATES, simplex_k)
         self.register_buffer("state_positions", self.topology.positions)
         self.register_buffer("alignment_matrix", self.topology.alignment_matrix)
 
-        self.states = nn.ModuleList()
+        # ── Router ──
+        self.router = NeedsBasedRouter(self.geo_dim, self.NUM_STATES)
+
+        # ── 512 states ──
+        states = []
         for i in range(self.NUM_STATES):
-            self.states.append(TopologicalState(
-                input_dim=patch_dim,
-                tokens_per_state=tokens_per_state,
-                token_dim=token_dim,
-                simplex_k=simplex_k,
-                deform_alpha=deform_alpha,
+            states.append(GeometricState(
+                geo_dim=self.geo_dim,
+                feat_dim=feat_dim,
+                num_patches=num_patches,
+                k=k,
+                edim=edim,
                 state_idx=i,
                 branch_path=self.topology.branch_paths[i],
                 staircase_val=float(self.topology.staircase_vals[i]),
+                n_heads=n_heads,
+                dropout=dropout,
             ))
+        self.states = nn.ModuleList(states)
 
+        # ── Cross-state composition ──
+        cross_heads = 5 if self.combined_dim % 5 == 0 else 3
         self.cross_compose = CrossStateComposition(
-            token_dim, tokens_per_state, simplex_k
+            combined_dim=self.combined_dim,
+            num_patches=num_patches,
+            n_heads=cross_heads,
+            dropout=dropout,
         )
 
-        self.cm = CayleyMengerValidator(simplex_k)
+        self.output_dim = self.combined_dim
+        self.patch_feat_dim = self.combined_dim * num_patches
+
+    def _patchify(self, latents: Tensor) -> Tensor:
+        """(B, C, H, W) → (B, P, patch_dim)"""
+        B, C, H, W = latents.shape
+        g = self.patch_grid
+        pH, pW = H // g, W // g
+        x = latents.reshape(B, C, g, pH, g, pW)
+        return x.permute(0, 2, 4, 1, 3, 5).reshape(B, g * g, -1)
+
+    def _lift(self, patches: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        """(B, P, patch_dim) → geo (B,P,11), feat (B,P,feat_dim), vol (B,P)"""
+        B, P, D = patches.shape
+        flat = patches.reshape(B * P, D)
+        geo, vol = self.geo_lift(flat)
+        geo = geo.reshape(B, P, self.geo_dim)
+        vol = vol.reshape(B, P)
+        feat = self.feat_lift(flat).reshape(B, P, self.feat_dim)
+        return geo, feat, vol
 
     def forward(
         self, latents: Tensor, active_budget: Optional[int] = None
-    ) -> ChunkOutput:
-        B = latents.shape[0]
+    ) -> PatchworkOutput:
+        """
+        Args:
+            latents:       (B, C, H, W)
+            active_budget: override max_active_states for this call
+        Returns:
+            PatchworkOutput with composed, geo, feat, vol_sq, loss
+        """
         budget = active_budget or self.max_active_states
+        P = self.num_patches
 
-        patches = self.patchifier(latents)
-        pooled = patches.mean(dim=1)
+        patches = self._patchify(latents)
+        geo, feat, lift_vol = self._lift(patches)
 
+        # Route — training uses all states, inference uses top-k
         active_idx, routing_w = self.router(
-            patches, self.state_positions, self.training
+            geo, self.state_positions, self.training
         )
+
         # Trim to budget
         if active_idx.shape[1] > budget:
-            active_idx = active_idx[:, :budget]
-            routing_w = F.softmax(routing_w[:, :budget], dim=-1)
+            if self.training:
+                # During training, keep top-budget by routing weight
+                _, top_idx = routing_w.topk(budget, dim=-1)
+                active_idx = torch.gather(active_idx, 1, top_idx)
+                routing_w = torch.gather(routing_w, 1, top_idx)
+                routing_w = F.softmax(routing_w, dim=-1)
+            else:
+                active_idx = active_idx[:, :budget]
+                routing_w = F.softmax(routing_w[:, :budget], dim=-1)
 
         n_active = active_idx.shape[1]
 
         # Single CPU transfer for dispatch indices (one sync, not N)
         active_idx_cpu = active_idx[0].tolist()
 
-        all_tokens = []
-        all_vol = []
-        for j in range(n_active):
-            tokens, vsq = self.states[active_idx_cpu[j]](pooled)
-            all_tokens.append(tokens)
-            all_vol.append(vsq)
+        # Run only active states
+        all_combined = []
+        all_vol = [lift_vol]
 
-        stacked = torch.cat(all_tokens, dim=1)
-        vol_sq = torch.stack(all_vol, dim=1)
+        for j in range(n_active):
+            state = self.states[active_idx_cpu[j]]
+            geo_s, feat_s, vol2 = state(geo, feat)
+            combined = torch.cat([geo_s, feat_s], dim=-1)
+            all_combined.append(combined)
+            all_vol.append(vol2)
+
+        stacked = torch.cat(all_combined, dim=1)      # (B, n_active*P, combined)
+        vol_sq = torch.stack(all_vol, dim=1)           # (B, 1+n_active, P)
 
         composed = self.cross_compose(
             stacked, active_idx, routing_w, self.alignment_matrix
         )
 
-        cm_loss = self.cm.validity_loss(vol_sq)
+        geo_out = composed[:, :, :self.geo_dim]
+        feat_out = composed[:, :, self.geo_dim:]
+        cm_loss = F.relu(-vol_sq).mean()
 
-        return ChunkOutput(
+        return PatchworkOutput(
             composed=composed,
+            geo=geo_out,
+            feat=feat_out,
             active_indices=active_idx,
             routing_weights=routing_w,
             vol_sq=vol_sq,
             loss=cm_loss,
-            loss_dict={"cm_validity": cm_loss.detach()},
         )
