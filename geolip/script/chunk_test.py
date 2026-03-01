@@ -11,7 +11,7 @@ Usage:
 
 import torch
 from geolip.core import CantorTopology
-from geolip.scales import Chunk
+from geolip.scales.chunk import Chunk
 
 
 def main():
