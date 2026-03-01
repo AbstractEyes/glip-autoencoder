@@ -6,6 +6,11 @@ Pentachoron-based multi-label classification head using geometric
 attractor basins. Each class is a 5-vertex crystal (pentachoron)
 in projection space with role-weighted cosine scoring.
 
+Initialization uses SimplexFactory to generate geometrically valid
+regular pentachora per class — not random noise hoping to find
+valid geometry. Each class starts as a proper pentachoron with
+equal edge lengths and positive volume.
+
 Designed to compose with:
     - Patchwork composed tokens:          (B, T, D)
     - SuperpositionPatchClassifier output: (B, 64, embed_dim) + optional (B, 64, 17) gates
@@ -61,6 +66,10 @@ class CrystalSuperpositionHead(nn.Module):
     by role. Multi-label behavior falls out naturally: each pentachoron
     is an independent attractor basin, not competing through softmax.
 
+    Initialization uses SimplexFactory(k=4, method=init_method) per class
+    to generate geometrically valid pentachora. Each class gets a unique
+    seed for reproducibility with class-specific separation.
+
     Args:
         feature_dim:    Input feature dimension (token_dim or embed_dim)
         num_classes:    Number of output classes
@@ -70,6 +79,9 @@ class CrystalSuperpositionHead(nn.Module):
                         Set to 0 when using raw Patchwork tokens.
         temperature:    Initial temperature for cosine scaling (learnable)
         role_weights:   Per-vertex role weights (5 floats). None uses defaults.
+        init_method:    SimplexFactory method ("regular", "random", "uniform")
+        init_scale:     Scale factor for simplex initialization
+        init_seed:      Base seed for reproducible crystal initialization
     """
 
     def __init__(
@@ -80,12 +92,18 @@ class CrystalSuperpositionHead(nn.Module):
         gate_dim: int = 0,
         temperature: float = 0.07,
         role_weights: Optional[list] = None,
+        init_method: str = "regular",
+        init_scale: float = 0.5,
+        init_seed: Optional[int] = None,
     ):
         super().__init__()
         self.feature_dim = feature_dim
         self.num_classes = num_classes
         self.crystal_dim = crystal_dim
         self.gate_dim = gate_dim
+        self.init_method = init_method
+        self.init_scale = init_scale
+        self.init_seed = init_seed
 
         # Projection: features (+ optional gates) → crystal space
         proj_input_dim = feature_dim + gate_dim
@@ -106,22 +124,93 @@ class CrystalSuperpositionHead(nn.Module):
         rw = role_weights if role_weights is not None else DEFAULT_ROLE_WEIGHTS
         self.register_buffer("role_weights", torch.tensor(rw, dtype=torch.float32))
 
+    def _init_pentachora(self, num_classes: int, dim: int) -> torch.Tensor:
+        """
+        Initialize pentachora using SimplexFactory.
+
+        Each class gets a regular pentachoron (k=4) in crystal_dim space,
+        with a class-specific centroid offset for inter-class separation.
+        Uses SimplexFactory for geometrically valid shapes; falls back
+        to analytical construction if factory unavailable.
+
+        Returns:
+            (C, 5, crystal_dim) tensor of pentachoron vertices
+        """
+        all_crystals = []
+        base_seed = self.init_seed or 42
+
+        # Class-specific centroid directions for separation
+        torch.manual_seed(base_seed)
+        centroid_dirs = F.normalize(torch.randn(num_classes, dim), dim=-1)
+
+        for c in range(num_classes):
+            # Generate one valid pentachoron per class
+            penta = self._make_one_pentachoron(dim, seed=base_seed + c)
+            # Offset by class centroid direction
+            penta = penta + centroid_dirs[c].unsqueeze(0) * self.init_scale
+            all_crystals.append(penta)
+
+        return torch.stack(all_crystals)  # (C, 5, dim)
+
+    def _make_one_pentachoron(self, dim: int, seed: int) -> torch.Tensor:
+        """
+        Generate a single pentachoron (5 vertices in dim-space).
+        Tries SimplexFactory first, falls back to analytical.
+
+        Returns:
+            (5, dim) tensor
+        """
+        try:
+            from geolip.vocabulary.simplex_factory import SimplexFactory
+
+            factory = SimplexFactory(
+                k=4,
+                embed_dim=dim,
+                method=self.init_method,
+                scale=self.init_scale,
+                seed=seed,
+            )
+            return factory.build_torch(
+                device="cpu", dtype=torch.float32, validate=False
+            )
+
+        except ImportError:
+            return self._regular_pentachoron_fallback(dim, seed)
+
     @staticmethod
-    def _init_pentachora(num_classes: int, dim: int) -> torch.Tensor:
+    def _regular_pentachoron_fallback(dim: int, seed: int) -> torch.Tensor:
         """
-        Initialize pentachora with class-specific centroids and vertex spread.
-        Each class gets 5 vertices forming a roughly regular pentachoron.
+        Analytical regular pentachoron construction.
+        Matches SimplexFactory(method="regular") output.
         """
-        # Random base + class-specific centroid offset for separation
-        crystals = torch.randn(num_classes, NUM_VERTICES, dim) * 0.1
-        centroids = F.normalize(torch.randn(num_classes, 1, dim), dim=-1) * 0.5
-        crystals = crystals + centroids
+        k = 4
+        V = 5
+        min_dim = V
 
-        # Per-vertex perturbation for internal pentachoron structure
-        for v in range(NUM_VERTICES):
-            crystals[:, v:v+1, :] += torch.randn(num_classes, 1, dim) * 0.1
+        verts = torch.full((V, min_dim), -1.0 / k)
+        coef = math.sqrt((k + 1.0) / k)
+        for i in range(V):
+            verts[i, i] = coef
 
-        return crystals
+        # Embed or truncate to dim
+        if dim > min_dim:
+            full = torch.zeros(V, dim)
+            full[:, :min_dim] = verts
+            # Use seed for reproducible extra-dimensional perturbation
+            gen = torch.Generator()
+            gen.manual_seed(seed)
+            full[:, min_dim:] = torch.randn(V, dim - min_dim, generator=gen) * 0.01
+            verts = full
+        else:
+            verts = verts[:, :dim]
+
+        # Center and normalize to unit edge length
+        verts = verts - verts.mean(dim=0, keepdim=True)
+        edge_len = (verts[1] - verts[0]).norm()
+        if edge_len > 1e-10:
+            verts = verts / edge_len
+
+        return verts
 
     def forward(
         self,
@@ -187,6 +276,15 @@ class CrystalSuperpositionHead(nn.Module):
             ).bool()
             inter_vals = inter_sim[inter_mask]
 
+            # Per-class edge length stats (how regular is each pentachoron?)
+            edge_lengths = []
+            for c in range(self.num_classes):
+                verts = self.crystals.data[c]  # (5, D) unnormalized
+                for i in range(5):
+                    for j in range(i + 1, 5):
+                        edge_lengths.append((verts[j] - verts[i]).norm().item())
+            edge_t = torch.tensor(edge_lengths)
+
         return {
             "intra_cos_mean": intra_vals.mean().item(),
             "intra_cos_std": intra_vals.std().item(),
@@ -194,6 +292,8 @@ class CrystalSuperpositionHead(nn.Module):
             "inter_cos_mean": inter_vals.mean().item(),
             "inter_cos_max": inter_vals.max().item(),
             "too_close_count": (inter_vals > 0.5).sum().item(),
+            "edge_length_mean": edge_t.mean().item(),
+            "edge_length_std": edge_t.std().item(),
         }
 
 
@@ -326,9 +426,10 @@ if __name__ == "__main__":
     print("=== CrystalSuperpositionHead Self-Test ===\n")
 
     # ── Test 1: Raw tokens (Patchwork mode, no gates) ──
-    print("--- Mode 1: Raw tokens (gate_dim=0) ---")
+    print("--- Mode 1: Raw tokens (gate_dim=0, regular init) ---")
     head = CrystalSuperpositionHead(
-        feature_dim=FEAT_DIM, num_classes=NUM_CLS, crystal_dim=CRYSTAL_DIM, gate_dim=0,
+        feature_dim=FEAT_DIM, num_classes=NUM_CLS, crystal_dim=CRYSTAL_DIM,
+        gate_dim=0, init_method="regular", init_seed=42,
     )
     tokens = torch.randn(4, 256, FEAT_DIM)
     scores, proj = head(tokens)
@@ -339,21 +440,38 @@ if __name__ == "__main__":
     # ── Test 2: Tokens + gates (SuperpositionPatchClassifier mode) ──
     print("\n--- Mode 2: Tokens + 17-dim gates (gate_dim=17) ---")
     head_gated = CrystalSuperpositionHead(
-        feature_dim=128, num_classes=NUM_CLS, crystal_dim=CRYSTAL_DIM, gate_dim=17,
+        feature_dim=128, num_classes=NUM_CLS, crystal_dim=CRYSTAL_DIM,
+        gate_dim=17, init_method="regular",
     )
     patch_feats = torch.randn(4, 64, 128)
     gate_vecs = torch.randn(4, 64, 17)
     scores_g, proj_g = head_gated(patch_feats, gate_vecs)
     print(f"  feats {patch_feats.shape} + gates {gate_vecs.shape} → scores {scores_g.shape}")
-    print(f"  Score range: [{scores_g.min():.3f}, {scores_g.max():.3f}]")
     print(f"  Params: {sum(p.numel() for p in head_gated.parameters()):,}")
 
-    # ── Test 3: Gates declared but not passed (zero-fill fallback) ──
-    print("\n--- Mode 3: Gates declared but not passed ---")
+    # ── Test 3: Gates declared but not passed ──
+    print("\n--- Mode 3: Gates declared but not passed (zero-fill) ---")
     scores_ng, _ = head_gated(patch_feats, gate_vectors=None)
-    print(f"  scores {scores_ng.shape} (zero-filled gates)")
+    print(f"  scores {scores_ng.shape}")
 
-    # ── Test 4: Rose loss ──
+    # ── Test 4: Crystal geometry after init ──
+    print("\n--- Crystal Geometry (post-init) ---")
+    diag = head.crystal_diagnostics()
+    for k, v in diag.items():
+        print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
+
+    # ── Test 5: Edge regularity per class ──
+    print("\n--- Edge Regularity (first 3 classes) ---")
+    for c in range(min(3, NUM_CLS)):
+        verts = head.crystals.data[c]  # (5, 128)
+        edges = []
+        for i in range(5):
+            for j in range(i + 1, 5):
+                edges.append((verts[j] - verts[i]).norm().item())
+        print(f"  Class {c}: edge mean={torch.tensor(edges).mean():.4f}, "
+              f"std={torch.tensor(edges).std():.6f}")
+
+    # ── Test 6: Rose loss ──
     print("\n--- Rose Loss ---")
     criterion = RoseLoss(margin=0.3)
     labels = torch.zeros(4, NUM_CLS)
@@ -366,18 +484,38 @@ if __name__ == "__main__":
     print(f"  Rose: {info['rose']:.4f}, Sep: {info['sep']:.4f}, Collapse: {info['collapse']:.4f}")
     print(f"  F1: {info['f1']:.4f}, Prec: {info['precision']:.4f}, Rec: {info['recall']:.4f}")
 
-    # ── Test 5: Gradient flow ──
+    # ── Test 7: Gradient flow ──
     print("\n--- Gradient Flow ---")
     loss.backward()
     crystal_grad = head.crystals.grad
     has_grad = crystal_grad is not None and crystal_grad.abs().sum() > 0
     print(f"  Crystal gradient: {'✓' if has_grad else '✗'}")
-    print(f"  Crystal grad norm: {crystal_grad.norm():.6f}" if has_grad else "")
+    if has_grad:
+        print(f"  Crystal grad norm: {crystal_grad.norm():.6f}")
 
-    # ── Test 6: Crystal diagnostics ──
-    print("\n--- Crystal Diagnostics ---")
-    diag = head.crystal_diagnostics()
-    for k, v in diag.items():
-        print(f"  {k}: {v}")
+    # ── Test 8: Init method comparison ──
+    print("\n--- Init Method Comparison ---")
+    for method in ["regular", "random", "uniform"]:
+        h = CrystalSuperpositionHead(
+            feature_dim=FEAT_DIM, num_classes=NUM_CLS, crystal_dim=CRYSTAL_DIM,
+            init_method=method, init_seed=42,
+        )
+        d = h.crystal_diagnostics()
+        print(f"  {method:8s}: intra_cos={d['intra_cos_mean']:.4f}, "
+              f"edge_std={d['edge_length_std']:.6f}, "
+              f"inter_cos={d['inter_cos_mean']:.4f}")
+
+    # ── Test 9: Reproducibility ──
+    print("\n--- Reproducibility ---")
+    h1 = CrystalSuperpositionHead(
+        feature_dim=FEAT_DIM, num_classes=NUM_CLS, crystal_dim=CRYSTAL_DIM,
+        init_method="regular", init_seed=42,
+    )
+    h2 = CrystalSuperpositionHead(
+        feature_dim=FEAT_DIM, num_classes=NUM_CLS, crystal_dim=CRYSTAL_DIM,
+        init_method="regular", init_seed=42,
+    )
+    match = torch.allclose(h1.crystals.data, h2.crystals.data)
+    print(f"  Same seed → same crystals: {'✓' if match else '✗'}")
 
     print("\n✓ crystal_superposition.py operational")

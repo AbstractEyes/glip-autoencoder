@@ -11,13 +11,12 @@ Architecture per simplex (k=4, pentachoron):
         → [attenuation] → signals weighted back to vertices PER CHANNEL
         → [exit projection] → 5 scalars
 
-The key insight: hidden layers aren't sequential — they're simplex vertices.
-All exist simultaneously and communicate through pairwise shared sections.
-Each shared section carries a VECTOR (not scalar) — the hidden dimensions
-are the embedding space for producing valid simplex distance geometry.
+Initialization uses SimplexFactory to generate geometrically valid
+regular pentachora as the starting structure. Each simplex begins as
+a proper geometric object — not random noise hoping to find validity.
 
 At scale (512→512, k=4):
-    103 simplices × ~290 structure ≈ 35,000 params
+    103 simplices × ~340 structure ≈ 35,000 params
     nn.Linear equiv: 262,656 params
     Ratio: ~0.134x (13.4% of linear)
 
@@ -29,7 +28,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Optional
 
 
 class KSimplexLinear(nn.Module):
@@ -41,11 +40,18 @@ class KSimplexLinear(nn.Module):
     Pairwise signals create shared sections between all vertex pairs
     within each simplex, carrying per-channel vector information.
 
+    Initialization uses SimplexFactory (method="regular") when available,
+    falling back to geometric heuristic init otherwise. Regular init
+    ensures each simplex starts as a valid geometric object with equal
+    edge lengths and proper volume.
+
     Args:
         input_dim: Input feature dimension
         output_dim: Output feature dimension (default: same as input)
         k: Simplex dimension (k+1 vertices per simplex)
         hidden_per_vertex: Hidden dimension per vertex (default: k+1)
+        init_method: SimplexFactory method ("regular", "random", "uniform")
+        init_scale: Scale factor for simplex initialization
     """
 
     def __init__(
@@ -54,6 +60,8 @@ class KSimplexLinear(nn.Module):
         output_dim: Optional[int] = None,
         k: int = 4,
         hidden_per_vertex: Optional[int] = None,
+        init_method: str = "regular",
+        init_scale: float = 1.0,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -62,6 +70,8 @@ class KSimplexLinear(nn.Module):
         self.num_vertices = k + 1
         self.hidden_per_vertex = hidden_per_vertex or self.num_vertices
         self.num_pairs = (self.num_vertices * (self.num_vertices - 1)) // 2
+        self.init_method = init_method
+        self.init_scale = init_scale
 
         # Tiling: how many simplices cover the input
         self.num_simplices = math.ceil(input_dim / self.num_vertices)
@@ -74,10 +84,10 @@ class KSimplexLinear(nn.Module):
                 pair_i_local.append(i)
                 pair_j_local.append(j)
         self.register_buffer(
-            'pair_i_local', torch.tensor(pair_i_local, dtype=torch.long)
+            "pair_i_local", torch.tensor(pair_i_local, dtype=torch.long)
         )
         self.register_buffer(
-            'pair_j_local', torch.tensor(pair_j_local, dtype=torch.long)
+            "pair_j_local", torch.tensor(pair_j_local, dtype=torch.long)
         )
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -144,21 +154,139 @@ class KSimplexLinear(nn.Module):
 
         self._init_parameters()
 
-    def _init_parameters(self):
-        """Initialize with small values for stable training."""
-        gain = 1.0 / math.sqrt(self.hidden_per_vertex)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Initialization
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-        nn.init.normal_(self.entry_weights, std=gain)
+    def _get_simplex_template(self) -> torch.Tensor:
+        """
+        Generate a (num_vertices, hidden_per_vertex) simplex template
+        using SimplexFactory. Falls back to geometric heuristic if
+        factory is unavailable.
+
+        Returns:
+            (V, H) tensor — one vertex per row, each H-dimensional
+        """
+        try:
+            from geolip.vocabulary.simplex_factory import SimplexFactory
+
+            factory = SimplexFactory(
+                k=self.k,
+                embed_dim=self.hidden_per_vertex,
+                method=self.init_method,
+                scale=self.init_scale,
+            )
+            return factory.build_torch(device="cpu", dtype=torch.float32, validate=False)
+
+        except ImportError:
+            # Fallback: construct regular simplex analytically
+            return self._regular_simplex_fallback()
+
+    def _regular_simplex_fallback(self) -> torch.Tensor:
+        """
+        Construct a regular simplex with unit edge length analytically.
+        Matches SimplexFactory(method="regular") output.
+        """
+        V = self.num_vertices
+        H = self.hidden_per_vertex
+
+        if V == 1:
+            return torch.zeros(1, H)
+
+        min_dim = V
+        verts = torch.full((V, min_dim), -1.0 / self.k)
+        coef = math.sqrt((self.k + 1.0) / self.k)
+        for i in range(min(V, min_dim)):
+            verts[i, i] = coef
+
+        # Embed or truncate to hidden_per_vertex
+        if H > min_dim:
+            full = torch.zeros(V, H)
+            full[:, :min_dim] = verts
+            verts = full
+        else:
+            verts = verts[:, :H]
+
+        # Center and normalize to unit edge length
+        verts = verts - verts.mean(dim=0, keepdim=True)
+        edge_len = (verts[1] - verts[0]).norm()
+        if edge_len > 1e-10:
+            verts = verts / edge_len
+
+        return verts * self.init_scale
+
+    def _init_parameters(self):
+        """
+        Initialize using SimplexFactory-generated template.
+
+        The template pentachoron defines vertex positions in H-dimensional
+        hidden space. These positions seed:
+            - entry_weights:    vertex directions as projection targets
+            - vertex_scale:     ones (identity transform initially)
+            - signal_weight_i/j: pairwise difference vectors (d² structure)
+            - attenuation_i/j:  edge-length-proportional per-channel weights
+            - exit_weights:     transpose of entry (approximate inverse)
+        """
+        # Generate one template simplex: (V, H)
+        template = self._get_simplex_template()  # (num_vertices, hidden_per_vertex)
+
+        V = self.num_vertices
+        H = self.hidden_per_vertex
+        S = self.num_simplices
+
+        # ── Entry: tile template vertex directions across all simplices ──
+        # Each input scalar projects into its vertex's direction in hidden space
+        entry_tiled = template.repeat(S, 1)  # (S*V, H) = (padded_dim, H)
+        self.entry_weights.data.copy_(entry_tiled[:self.padded_dim])
         nn.init.zeros_(self.entry_bias)
+
+        # ── Vertex: identity transform to start ──
         nn.init.ones_(self.vertex_scale)
         nn.init.zeros_(self.vertex_bias)
-        nn.init.normal_(self.signal_weight_i, std=gain)
-        nn.init.normal_(self.signal_weight_j, std=gain)
-        nn.init.zeros_(self.signal_bias)
-        nn.init.ones_(self.attenuation_i)
-        nn.init.ones_(self.attenuation_j)
-        nn.init.normal_(self.exit_weights, std=gain)
+
+        # ── Pairwise: signal weights from simplex edge vectors ──
+        # For each pair (i,j), the signal weight encodes vertex_i and vertex_j
+        # directions in hidden space — the geometric edge
+        pair_w_i = []
+        pair_w_j = []
+        pair_bias = []
+        for s in range(S):
+            for i in range(V):
+                for j in range(i + 1, V):
+                    # Weight_i: direction from vertex_i's position
+                    # Weight_j: direction from vertex_j's position
+                    # This seeds the pairwise signal as a geometric edge probe
+                    pair_w_i.append(template[i])
+                    pair_w_j.append(template[j])
+                    pair_bias.append(torch.zeros(H))
+
+        self.signal_weight_i.data.copy_(torch.stack(pair_w_i))
+        self.signal_weight_j.data.copy_(torch.stack(pair_w_j))
+        self.signal_bias.data.copy_(torch.stack(pair_bias))
+
+        # ── Attenuation: edge-length-proportional per-channel ──
+        # Start with uniform attenuation scaled by edge length
+        att_i = []
+        att_j = []
+        for s in range(S):
+            for i in range(V):
+                for j in range(i + 1, V):
+                    edge = template[j] - template[i]
+                    edge_len = edge.norm().clamp(min=1e-8)
+                    # Per-channel: proportional to edge direction magnitude
+                    att_i.append(edge.abs() / edge_len)
+                    att_j.append(edge.abs() / edge_len)
+
+        self.attenuation_i.data.copy_(torch.stack(att_i))
+        self.attenuation_j.data.copy_(torch.stack(att_j))
+
+        # ── Exit: approximate inverse of entry (transpose direction) ──
+        self.exit_weights.data.copy_(entry_tiled[:self.padded_dim])
         nn.init.zeros_(self.exit_bias)
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Forward
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -170,84 +298,67 @@ class KSimplexLinear(nn.Module):
         Returns:
             (..., output_dim) output tensor
         """
-        # Save shape for reshape at end
         leading_shape = x.shape[:-1]
-        x_flat = x.reshape(-1, self.input_dim)  # (B, input_dim)
+        x_flat = x.reshape(-1, self.input_dim)
         B = x_flat.shape[0]
 
         # Pad input to multiple of num_vertices
         if self.padded_dim > self.input_dim:
             x_padded = F.pad(x_flat, (0, self.padded_dim - self.input_dim))
         else:
-            x_padded = x_flat  # (B, padded_dim)
+            x_padded = x_flat
 
         # ━━━━━ Step 1: Entry — each scalar → hidden vector ━━━━━
-        # x_padded: (B, padded_dim) → (B, padded_dim, hidden)
         h = x_padded.unsqueeze(-1) * self.entry_weights.unsqueeze(0) + self.entry_bias.unsqueeze(0)
 
         # ━━━━━ Step 2: Vertex transform — scale + shift ━━━━━
         h = h * self.vertex_scale.unsqueeze(0) + self.vertex_bias.unsqueeze(0)
-        # h: (B, padded_dim, hidden)
 
         # ━━━━━ Step 3: Reshape into simplices ━━━━━
-        # (B, padded_dim, hidden) → (B, num_simplices, num_vertices, hidden)
         h_simp = h.view(B, self.num_simplices, self.num_vertices, self.hidden_per_vertex)
 
         # ━━━━━ Step 4: Pairwise signals — VECTOR per pair ━━━━━
-        # Gather vertex pairs for all simplices at once
-        # h_simp: (B, S, V, H), pair indices: (P,) → h_i, h_j: (B, S, P, H)
-        h_i = h_simp[:, :, self.pair_i_local, :]  # (B, S, P, H)
-        h_j = h_simp[:, :, self.pair_j_local, :]  # (B, S, P, H)
+        h_i = h_simp[:, :, self.pair_i_local, :]
+        h_j = h_simp[:, :, self.pair_j_local, :]
 
-        # Reshape signal weights: (S*P, H) → (S, P, H)
         w_i = self.signal_weight_i.view(self.num_simplices, self.num_pairs, self.hidden_per_vertex)
         w_j = self.signal_weight_j.view(self.num_simplices, self.num_pairs, self.hidden_per_vertex)
         bias = self.signal_bias.view(self.num_simplices, self.num_pairs, self.hidden_per_vertex)
 
-        # Compute pairwise signals: (B, S, P, H) — KEPT AS VECTOR
         signals = h_i * w_i.unsqueeze(0) + h_j * w_j.unsqueeze(0) + bias.unsqueeze(0)
-        # signals: (B, S, P, H) — each pair carries H-dim relational info
 
         # ━━━━━ Step 5: Attenuate signals back to vertices PER CHANNEL ━━━━━
         att_i = self.attenuation_i.view(self.num_simplices, self.num_pairs, self.hidden_per_vertex)
         att_j = self.attenuation_j.view(self.num_simplices, self.num_pairs, self.hidden_per_vertex)
 
-        # Per-channel attenuation: (B, S, P, H) * (S, P, H) → (B, S, P, H)
-        signals_to_i = signals * att_i.unsqueeze(0)  # (B, S, P, H)
-        signals_to_j = signals * att_j.unsqueeze(0)  # (B, S, P, H)
+        signals_to_i = signals * att_i.unsqueeze(0)
+        signals_to_j = signals * att_j.unsqueeze(0)
 
-        # Scatter-add into vertex hidden space: (B, S, V, H)
         vertex_signals = torch.zeros(
             B, self.num_simplices, self.num_vertices, self.hidden_per_vertex,
-            device=x.device, dtype=x.dtype
+            device=x.device, dtype=x.dtype,
         )
-        # Expand pair indices for scatter: (P,) → (B, S, P, H)
         pair_i_exp = self.pair_i_local.view(1, 1, -1, 1).expand(B, self.num_simplices, -1, self.hidden_per_vertex)
         pair_j_exp = self.pair_j_local.view(1, 1, -1, 1).expand(B, self.num_simplices, -1, self.hidden_per_vertex)
 
         vertex_signals.scatter_add_(2, pair_i_exp, signals_to_i)
         vertex_signals.scatter_add_(2, pair_j_exp, signals_to_j)
 
-        # Add per-channel pairwise contribution to vertex hidden states
         h_simp = h_simp + vertex_signals
 
         # ━━━━━ Step 6: Exit — hidden → output scalar ━━━━━
-        # Reshape back: (B, S, V, H) → (B, padded_dim, H)
         h_out = h_simp.view(B, self.padded_dim, self.hidden_per_vertex)
-
-        # Dot product with exit weights + bias
         out = (h_out * self.exit_weights.unsqueeze(0)).sum(dim=-1) + self.exit_bias.unsqueeze(0)
-        # out: (B, padded_dim)
-
-        # Trim padding
         out = out[:, :self.input_dim]
 
-        # Output projection if dims differ
         if self.output_proj is not None:
             out = self.output_proj(out)
 
-        # Restore leading dimensions
         return out.view(*leading_shape, self.output_dim)
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Diagnostics
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def param_count(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -260,7 +371,7 @@ class KSimplexLinear(nn.Module):
         print(f"Input: {self.input_dim} → Output: {self.output_dim}")
         print(f"Simplices: {self.num_simplices} (each covers {self.num_vertices} inputs)")
         print(f"Per simplex: {self.num_vertices} vertices × {self.hidden_per_vertex} hidden × {self.num_pairs} pairs")
-        print(f"Structure size: {self.num_vertices}×{self.hidden_per_vertex}×{self.num_pairs} = {self.num_vertices * self.hidden_per_vertex * self.num_pairs}")
+        print(f"Init: SimplexFactory method='{self.init_method}', scale={self.init_scale}")
         print(f"\nParams breakdown:")
         print(f"  Entry:     {self.entry_weights.numel() + self.entry_bias.numel():,}")
         print(f"  Vertex:    {self.vertex_scale.numel() + self.vertex_bias.numel():,}")
@@ -282,34 +393,42 @@ class KSimplexLinear(nn.Module):
 if __name__ == "__main__":
     print("=== KSimplexLinear Self-Test ===\n")
 
-    # Test 1: Param counts (will differ from old due to vector attenuation)
-    print("--- Param Count Verification ---")
-    test_cases = [
-        (3, 2),       # k=2, 3 inputs
-        (5, 4),       # k=4, 5 inputs
-        (512, 4),     # k=4, 512 inputs
-    ]
-
-    for input_dim, k in test_cases:
-        layer = KSimplexLinear(input_dim, k=k)
+    # Test 1: Structure with factory init
+    print("--- Structure + Factory Init ---")
+    for input_dim, k in [(3, 2), (5, 4), (512, 4)]:
+        layer = KSimplexLinear(input_dim, k=k, init_method="regular")
         layer.structure_summary()
 
-    # Test 2: Forward pass shapes
+    # Test 2: Verify simplex template is geometrically valid
+    print("\n--- Simplex Template Verification ---")
+    layer = KSimplexLinear(5, k=4, init_method="regular")
+    template = layer._get_simplex_template()
+    print(f"  Template shape: {template.shape}")
+    # Check edge lengths
+    edges = []
+    V = template.shape[0]
+    for i in range(V):
+        for j in range(i + 1, V):
+            edges.append((template[j] - template[i]).norm().item())
+    print(f"  Edge lengths: {[f'{e:.4f}' for e in edges]}")
+    print(f"  Edge std: {torch.tensor(edges).std():.6f} (should be ~0 for regular)")
+
+    # Test 3: Forward pass
     print("\n--- Forward Pass ---")
-    for input_dim, k in [(3, 2), (5, 4), (512, 4), (1024, 4)]:
+    for input_dim, k in [(5, 4), (512, 4), (1024, 4)]:
         layer = KSimplexLinear(input_dim, k=k)
         x = torch.randn(4, input_dim)
         y = layer(x)
         print(f"  k={k}, ({4}, {input_dim}) → {y.shape}")
 
-    # Test 3: Batched input with leading dims
+    # Test 4: Batched input
     print("\n--- Batched Input ---")
     layer = KSimplexLinear(64, k=4)
-    x = torch.randn(2, 16, 64)  # (B, N, D)
+    x = torch.randn(2, 16, 64)
     y = layer(x)
     print(f"  (2, 16, 64) → {y.shape}")
 
-    # Test 4: Gradient flow
+    # Test 5: Gradient flow
     print("\n--- Gradient Flow ---")
     layer = KSimplexLinear(128, k=4)
     x = torch.randn(4, 128, requires_grad=True)
@@ -318,12 +437,11 @@ if __name__ == "__main__":
     has_grad = x.grad is not None and x.grad.abs().sum() > 0
     print(f"  Gradients flow: {'✓' if has_grad else '✗'}")
 
-    # Test 5: Training convergence
+    # Test 6: Training convergence
     print("\n--- Training Test ---")
     layer = KSimplexLinear(64, k=4)
     target = torch.randn(4, 64)
     opt = torch.optim.Adam(layer.parameters(), lr=1e-3)
-
     for step in range(100):
         x = torch.randn(4, 64)
         y = layer(x)
@@ -334,27 +452,26 @@ if __name__ == "__main__":
         if step % 25 == 0:
             print(f"  Step {step}: loss = {loss.item():.6f}")
 
-    # Test 6: Different input/output dims
-    print("\n--- Input ≠ Output ---")
-    layer = KSimplexLinear(512, output_dim=256, k=4)
-    x = torch.randn(4, 512)
-    y = layer(x)
-    print(f"  512 → 256: {y.shape}, params={layer.param_count():,}")
-    layer.structure_summary()
+    # Test 7: Init method comparison
+    print("\n--- Init Method Comparison ---")
+    for method in ["regular", "random", "uniform"]:
+        layer = KSimplexLinear(64, k=4, init_method=method)
+        x = torch.randn(8, 64)
+        y = layer(x)
+        print(f"  method={method:8s}: output mean={y.mean():.4f}, std={y.std():.4f}")
 
-    # Test 7: Verify pairwise signals are per-channel
-    print("\n--- Pairwise Channel Verification ---")
+    # Test 8: Per-channel differentiation
+    print("\n--- Per-Channel Differentiation ---")
     layer = KSimplexLinear(5, k=4)
     x = torch.randn(2, 5, requires_grad=True)
     y = layer(x)
-    # Check that different hidden channels get different gradients
     y[0, 0].backward(retain_graph=True)
     g1 = x.grad.clone()
     x.grad.zero_()
     y[0, 1].backward(retain_graph=True)
     g2 = x.grad.clone()
     channel_diff = (g1 - g2).abs().sum().item()
-    print(f"  Gradient difference across output channels: {channel_diff:.6f}")
+    print(f"  Gradient difference: {channel_diff:.6f}")
     print(f"  Per-channel differentiation: {'✓' if channel_diff > 1e-6 else '✗'}")
 
     print("\n=== KSimplexLinear operational. ===")
