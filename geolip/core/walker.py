@@ -13,16 +13,7 @@ Based on the Alucard/FieldWalkerFusion architecture:
     BlendMode  x  Schedule  x  Aggregation
     (how)         (when)       (pool)
 
-Design:
-    - All states produce outputs in parallel (no routing, no killing)
-    - Each state's output is mask-conditioned (9-dim -> feature gating)
-    - Walker blends perspectives pairwise, weighted by boundary_bias
-    - Aggregation pools across the walked field
-
-    state_outputs: (B, S, P, D)  -- S simultaneous perspectives
-    masks:         (S, M)         -- topology interference patterns
-    boundary_bias: (S, S)         -- pairwise alignment / walking distance
-    -> walked:     (B, P, D)      -- fused output
+Fully vectorized — no Python loops in forward pass.
 
 Copyright 2025-2026 AbstractPhil
 MIT License
@@ -40,15 +31,15 @@ from torch import Tensor
 
 
 # =============================================================================
-# BLEND MODES -- how to combine two perspectives at a given alpha
+# BLEND MODES -- vectorized for (B, S, S, P, D) pairwise operation
 # =============================================================================
 # All: (a, b, alpha) -> blended
-#   a, b:    (*, D)
-#   alpha:   scalar or (*,) or (*, 1)  in [0, 1]
-#   returns: (*, D)
+#   a, b:    (..., D)
+#   alpha:   (...) or (..., 1) in [0, 1]
+#   returns: (..., D)
 
 def blend_lerp(a: Tensor, b: Tensor, alpha: Tensor) -> Tensor:
-    """Linear interpolation. Standard baseline."""
+    """Linear interpolation."""
     if alpha.dim() < a.dim():
         alpha = alpha.unsqueeze(-1)
     return a + alpha * (b - a)
@@ -90,17 +81,12 @@ def blend_gilgamesh(a: Tensor, b: Tensor, alpha: Tensor) -> Tensor:
 
 
 def blend_slip(a: Tensor, b: Tensor, alpha: Tensor) -> Tensor:
-    """Entropic phase gating. Content-dependent blend.
-
-    Where perspectives agree: smooth blend.
-    Where they disagree: sharp phase boundary.
-    """
+    """Entropic phase gating. Content-dependent blend."""
     if alpha.dim() < a.dim():
         alpha = alpha.unsqueeze(-1)
     delta = b - a
     gate = torch.sigmoid((delta * b).sum(dim=-1, keepdim=True))
-    effective_alpha = alpha * gate
-    return a + effective_alpha * delta
+    return a + (alpha * gate) * delta
 
 
 BLEND_MODES: Dict[str, Callable] = {
@@ -113,32 +99,23 @@ BLEND_MODES: Dict[str, Callable] = {
 
 
 # =============================================================================
-# SCHEDULES -- how alpha evolves across the topology
+# SCHEDULES
 # =============================================================================
 
 def schedule_linear(n: int, device: torch.device = None) -> Tensor:
-    """Uniform spacing [0, 1]."""
     return torch.linspace(0, 1, n, device=device)
 
-
 def schedule_cosine(n: int, device: torch.device = None) -> Tensor:
-    """Cosine: slow-fast-slow progression."""
     t = torch.linspace(0, 1, n, device=device)
     return (1 - torch.cos(t * math.pi)) / 2
 
-
 def schedule_tau(n: int, device: torch.device = None) -> Tensor:
-    """Golden ratio (tau) spacing. Fibonacci-like quasi-uniform coverage."""
     tau_val = (1 + math.sqrt(5)) / 2
     indices = torch.arange(n, device=device, dtype=torch.float32)
-    raw = (indices / tau_val) % 1.0
-    return raw.sort().values
-
+    return ((indices / tau_val) % 1.0).sort().values
 
 def schedule_from_topology(depth_positions: Tensor) -> Tensor:
-    """Use topology depth positions directly as the schedule."""
     return depth_positions
-
 
 SCHEDULES: Dict[str, Callable] = {
     "linear": schedule_linear,
@@ -148,58 +125,46 @@ SCHEDULES: Dict[str, Callable] = {
 
 
 # =============================================================================
-# AGGREGATIONS -- how to pool walked perspectives into final output
+# AGGREGATIONS
 # =============================================================================
 
 def agg_mean(walked: Tensor, **kwargs) -> Tensor:
-    """Simple mean across states. (B, S, P, D) -> (B, P, D)."""
+    """(B, S, P, D) -> (B, P, D)"""
     return walked.mean(dim=1)
 
 
 def agg_weighted(walked: Tensor, weights: Tensor = None, **kwargs) -> Tensor:
-    """Weighted sum. weights: (S,) or (B, S)."""
+    """(B, S, P, D) x (S,) -> (B, P, D)"""
     if weights is None:
         return walked.mean(dim=1)
-    if weights.dim() == 1:
-        w = weights.view(1, -1, 1, 1)
-    else:
-        w = weights.unsqueeze(-1).unsqueeze(-1)
-    w = F.softmax(w, dim=1)
+    w = F.softmax(weights.view(1, -1, 1, 1), dim=1)
     return (walked * w).sum(dim=1)
 
 
-def agg_similarity_tree(
-    walked: Tensor,
-    boundary_bias: Tensor = None,
-    **kwargs,
-) -> Tensor:
-    """Hierarchical merge guided by topology similarity.
-
-    Consensus states (high alignment to many) weigh more.
-    Unique states (low alignment) contribute residual.
+def agg_similarity_tree(walked: Tensor, boundary_bias: Tensor = None, **kwargs) -> Tensor:
+    """Consensus + unique residual guided by boundary_bias.
 
     walked:        (B, S, P, D)
     boundary_bias: (S, S)
     -> (B, P, D)
     """
-    B, S, P, D = walked.shape
-
     if boundary_bias is None:
         return walked.mean(dim=1)
 
+    B, S, P, D = walked.shape
+
+    # Off-diagonal importance: how much each state is pulled by others
     off_diag = boundary_bias.clone()
     off_diag.fill_diagonal_(0.0)
+    state_importance = off_diag.sum(dim=1)                    # (S,)
+    merge_weights = F.softmax(state_importance, dim=0)        # (S,)
 
-    # State importance = total alignment pull from others
-    state_importance = off_diag.sum(dim=1)  # (S,)
-    merge_weights = F.softmax(state_importance, dim=0)  # (S,)
-
-    # Consensus: weighted sum by importance
+    # Consensus: importance-weighted sum
     consensus = (walked * merge_weights.view(1, S, 1, 1)).sum(dim=1)  # (B, P, D)
 
-    # Residual: unique perspectives contribute their deviations
-    uniqueness = 1.0 - merge_weights
-    deviations = walked - consensus.unsqueeze(1)
+    # Residual: unique perspectives add their deviations
+    uniqueness = 1.0 - merge_weights                          # (S,)
+    deviations = walked - consensus.unsqueeze(1)              # (B, S, P, D)
     unique_residual = (deviations * uniqueness.view(1, S, 1, 1)).sum(dim=1)
 
     return consensus + unique_residual
@@ -213,14 +178,14 @@ AGGREGATIONS: Dict[str, Callable] = {
 
 
 # =============================================================================
-# MASK CONDITIONING -- topology masks gate feature channels
+# MASK CONDITIONING -- fully vectorized across all states
 # =============================================================================
 
 class MaskConditioner(nn.Module):
-    """Project topology masks into feature-space gates.
+    """Topology masks -> feature-space gates, applied to all states at once.
 
-    'direct': zero params. Groups mask dims across feature channels.
-    'learned': Linear(mask_dim, feature_dim) projection.
+    'direct': 0 params. Precomputes (S, D) gate matrix from (S, M) masks.
+    'learned': Linear(M, D) shared across states.
     """
 
     def __init__(self, mask_dim: int, feature_dim: int, mode: str = "direct"):
@@ -234,11 +199,10 @@ class MaskConditioner(nn.Module):
         elif mode == "direct":
             self.register_buffer("group_map", self._build_group_map(mask_dim, feature_dim))
         else:
-            raise ValueError(f"Unknown mode: {mode}. Use 'direct' or 'learned'.")
+            raise ValueError(f"Unknown mode: {mode}")
 
     @staticmethod
     def _build_group_map(mask_dim: int, feature_dim: int) -> Tensor:
-        """Assign each feature channel to a mask dimension."""
         group_size = feature_dim // mask_dim
         remainder = feature_dim % mask_dim
         mapping = torch.zeros(feature_dim, dtype=torch.long)
@@ -249,42 +213,32 @@ class MaskConditioner(nn.Module):
             idx += size
         return mapping
 
-    def forward(self, features: Tensor, mask: Tensor) -> Tensor:
-        """Apply mask conditioning.
+    def forward(self, features: Tensor, masks: Tensor) -> Tensor:
+        """Apply all mask gates at once.
 
-        features: (B, P, D) or (*, D)
-        mask:     (M,) -- single state's topology mask
-        returns:  same shape, gated
+        features: (B, S, P, D)
+        masks:    (S, M)
+        returns:  (B, S, P, D) -- gated
         """
         if self.mode == "learned":
-            gate = torch.sigmoid(self.proj(mask))
+            gates = torch.sigmoid(self.proj(masks))       # (S, D)
         else:
-            gate = torch.sigmoid(mask[self.group_map])
-        return features * gate
+            gates = torch.sigmoid(masks[:, self.group_map])  # (S, D)
+        # Broadcast: (1, S, 1, D) * (B, S, P, D)
+        return features * gates.unsqueeze(0).unsqueeze(2)
 
 
 # =============================================================================
-# TOPOLOGY WALKER -- the thousand in one
+# TOPOLOGY WALKER -- the thousand in one, fully vectorized
 # =============================================================================
 
 class TopologyWalker(nn.Module):
     """Field walking fusion across simultaneous topology perspectives.
 
-    All states fire. No routing. Every perspective lives. The walker
-    defines interference through blend mode, schedule, and aggregation,
-    all structured by the topology.
+    All states fire. No routing. Every perspective lives.
+    Fully vectorized -- zero Python loops in forward.
 
     Replaces: NeedsBasedRouter + CrossStateComposition
-
-    Args:
-        num_states:       Number of simultaneous perspectives (S)
-        feature_dim:      Per-patch feature dimension (D)
-        mask_dim:         Topology mask dimension (9 for Mobius)
-        blend_mode:       'lerp', 'slerp', 'shiva', 'gilgamesh', 'slip'
-        schedule:         'linear', 'cosine', 'tau', 'topology'
-        aggregation:      'mean', 'weighted', 'similarity_tree'
-        mask_mode:        'direct' (0 params) or 'learned' (small projection)
-        learnable_weights: Learn per-state importance weights
     """
 
     def __init__(
@@ -319,22 +273,6 @@ class TopologyWalker(nn.Module):
 
         self.output_norm = nn.LayerNorm(feature_dim)
 
-    def _compute_alphas(
-        self,
-        boundary_bias: Tensor,
-        depth_positions: Tensor,
-        device: torch.device,
-    ) -> Tensor:
-        """Compute pairwise blend alphas from topology.
-
-        Returns: (S, S) alpha matrix.
-        """
-        if self.schedule_name == "topology":
-            return boundary_bias
-        else:
-            sched = SCHEDULES[self.schedule_name](self.num_states, device=device)
-            return 1.0 - (sched.unsqueeze(0) - sched.unsqueeze(1)).abs()
-
     def forward(
         self,
         state_outputs: Tensor,
@@ -342,47 +280,59 @@ class TopologyWalker(nn.Module):
         boundary_bias: Tensor,
         depth_positions: Tensor,
     ) -> Tensor:
-        """Walk the topology field.
+        """Walk the topology field. Fully vectorized.
 
         Args:
-            state_outputs:   (B, S, P, D) -- all state outputs
-            masks:           (S, M) -- topology masks per state
-            boundary_bias:   (S, S) -- pairwise alignment
-            depth_positions: (S,) -- topology depth schedule
+            state_outputs:   (B, S, P, D)
+            masks:           (S, M)
+            boundary_bias:   (S, S)
+            depth_positions: (S,)
 
         Returns:
-            (B, P, D) -- fused output
+            (B, P, D)
         """
         B, S, P, D = state_outputs.shape
 
-        # -- Step 1: Mask conditioning --
-        # Each state's features gated by its topology mask fingerprint.
-        conditioned = torch.stack([
-            self.conditioner(state_outputs[:, si], masks[si])
-            for si in range(S)
-        ], dim=1)  # (B, S, P, D)
+        # -- Step 1: Mask conditioning (vectorized over all states) --
+        # (B, S, P, D) * (1, S, 1, D) -> (B, S, P, D)
+        conditioned = self.conditioner(state_outputs, masks)
 
-        # -- Step 2: Pairwise topology-weighted blending --
-        alphas = self._compute_alphas(boundary_bias, depth_positions, state_outputs.device)
+        # -- Step 2: Pairwise topology-weighted blending (fully vectorized) --
+        # Compute alpha matrix
+        if self.schedule_name == "topology":
+            alphas = boundary_bias                             # (S, S)
+        else:
+            sched = SCHEDULES[self.schedule_name](S, device=state_outputs.device)
+            alphas = 1.0 - (sched.unsqueeze(0) - sched.unsqueeze(1)).abs()
 
-        # Blend weights: row-normalized off-diagonal alphas
+        # Blend weights: row-normalized off-diagonal
         blend_w = alphas.clone()
         blend_w.fill_diagonal_(0.0)
         blend_w = blend_w / blend_w.sum(dim=1, keepdim=True).clamp(min=1e-8)  # (S, S)
 
-        # Vectorized blending: for each state, blend with all others
-        # conditioned[:, si] blended toward conditioned[:, sj] at alpha[si, sj]
-        walked = torch.zeros_like(conditioned)
-        for si in range(S):
-            own = conditioned[:, si]  # (B, P, D)
-            contributions = torch.zeros_like(own)
-            for sj in range(S):
-                if si == sj:
-                    continue
-                other = conditioned[:, sj]
-                blended = self.blend_fn(own, other, alphas[si, sj])
-                contributions = contributions + blend_w[si, sj] * blended
-            walked[:, si] = own + contributions
+        # Expand for all-pairs blending:
+        #   own:   (B, S, 1, P, D) -- each state's conditioned output
+        #   other: (B, 1, S, P, D) -- all states as blend targets
+        own   = conditioned.unsqueeze(2)                       # (B, S, 1, P, D)
+        other = conditioned.unsqueeze(1)                       # (B, 1, S, P, D)
+
+        # Expand own to (B, S, S, P, D) for broadcast with other
+        own_expanded = own.expand(B, S, S, P, D)
+        other_expanded = other.expand(B, S, S, P, D)
+
+        # Alpha for each (i, j) pair: (S, S) -> (1, S, S, 1, 1)
+        alpha_ij = alphas.view(1, S, S, 1, 1)
+
+        # Blend all pairs at once: (B, S, S, P, D)
+        blended = self.blend_fn(own_expanded, other_expanded, alpha_ij)
+
+        # Weight by blend_w and sum over j (source states)
+        # blend_w: (S, S) -> (1, S, S, 1, 1), zero diagonal already
+        w = blend_w.view(1, S, S, 1, 1)
+        contributions = (blended * w).sum(dim=2)               # (B, S, P, D)
+
+        # Final walked = own + weighted blend from others
+        walked = conditioned + contributions                    # (B, S, P, D)
 
         # -- Step 3: Aggregation --
         if self.aggregation_name == "similarity_tree":
@@ -403,35 +353,15 @@ class TopologyWalker(nn.Module):
 
 
 # =============================================================================
-# PRESETS -- named configs matching Alucard conventions
+# PRESETS
 # =============================================================================
 
 WALKER_PRESETS: Dict[str, Dict[str, str]] = {
-    "alucard": {
-        "blend_mode": "lerp",
-        "schedule": "topology",
-        "aggregation": "mean",
-    },
-    "shiva": {
-        "blend_mode": "shiva",
-        "schedule": "topology",
-        "aggregation": "similarity_tree",
-    },
-    "gilgamesh": {
-        "blend_mode": "gilgamesh",
-        "schedule": "topology",
-        "aggregation": "weighted",
-    },
-    "slip": {
-        "blend_mode": "slip",
-        "schedule": "cosine",
-        "aggregation": "similarity_tree",
-    },
-    "slerp": {
-        "blend_mode": "slerp",
-        "schedule": "linear",
-        "aggregation": "weighted",
-    },
+    "alucard": {"blend_mode": "lerp", "schedule": "topology", "aggregation": "mean"},
+    "shiva": {"blend_mode": "shiva", "schedule": "topology", "aggregation": "similarity_tree"},
+    "gilgamesh": {"blend_mode": "gilgamesh", "schedule": "topology", "aggregation": "weighted"},
+    "slip": {"blend_mode": "slip", "schedule": "cosine", "aggregation": "similarity_tree"},
+    "slerp": {"blend_mode": "slerp", "schedule": "linear", "aggregation": "weighted"},
 }
 
 
@@ -444,10 +374,7 @@ def from_preset(
     learnable_weights: bool = False,
     **overrides,
 ) -> TopologyWalker:
-    """Create TopologyWalker from named preset.
-
-    # >>> walker = from_preset('shiva', num_states=8, feature_dim=75, mask_dim=9)
-    """
+    """Create TopologyWalker from named preset."""
     if preset not in WALKER_PRESETS:
         raise ValueError(f"Unknown preset: {preset}. Available: {list(WALKER_PRESETS)}")
     config = WALKER_PRESETS[preset].copy()
@@ -473,7 +400,6 @@ if __name__ == "__main__":
     S, P, D, M = 8, 16, 75, 9
     B = 4
 
-    # Simulate topology
     masks = torch.rand(S, M, device=device)
     masks_norm = F.normalize(masks, dim=-1)
     boundary_bias = masks_norm @ masks_norm.T
@@ -496,17 +422,15 @@ if __name__ == "__main__":
     for name, fn in SCHEDULES.items():
         sched = fn(S, device=device)
         print(f"  {name:12s}: [{', '.join(f'{v:.3f}' for v in sched.tolist())}]")
-    topo_sched = schedule_from_topology(depth_positions)
-    print(f"  {'topology':12s}: [{', '.join(f'{v:.3f}' for v in topo_sched.tolist())}]")
 
     print(f"\n{'=' * 60}")
-    print("MASK CONDITIONER")
+    print("MASK CONDITIONER (vectorized)")
     print(f"{'=' * 60}")
     for mode in ["direct", "learned"]:
         cond = MaskConditioner(M, D, mode=mode).to(device)
         n_params = sum(p.numel() for p in cond.parameters())
-        gated = cond(a, masks[0])
-        print(f"  {mode:10s}: {gated.shape}, params={n_params}")
+        gated = cond(state_outputs, masks)
+        print(f"  {mode:10s}: {state_outputs.shape} -> {gated.shape}, params={n_params}")
 
     print(f"\n{'=' * 60}")
     print("WALKER PRESETS")
@@ -526,9 +450,19 @@ if __name__ == "__main__":
     out = walker(state_outputs_g, masks, boundary_bias, depth_positions)
     loss = out.sum()
     loss.backward()
-    print(f"  grad on state_outputs: {state_outputs_g.grad is not None}")
-    print(f"  grad shape: {state_outputs_g.grad.shape}")
+    print(f"  grad exists: {state_outputs_g.grad is not None}")
+    print(f"  grad shape:  {state_outputs_g.grad.shape}")
     if walker.state_weights is not None:
         print(f"  state_weights grad: {walker.state_weights.grad}")
+
+    print(f"\n{'=' * 60}")
+    print("MEMORY: (B, S, S, P, D) expansion")
+    print(f"{'=' * 60}")
+    elem = B * S * S * P * D * 4  # float32
+    print(f"  B={B}, S={S}, P={P}, D={D}")
+    print(f"  Pairwise tensor: {elem / 1024 / 1024:.1f} MB")
+    # At training scale: B=32
+    elem32 = 32 * S * S * P * D * 4
+    print(f"  B=32 training:   {elem32 / 1024 / 1024:.1f} MB")
 
     print(f"\n  walker.py self-test complete")
